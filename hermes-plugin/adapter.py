@@ -290,6 +290,11 @@ class ZaloAdapter(BasePlatformAdapter):
         self._stop = False
         self._last_event_id = 0
 
+        # Message dedup ring: skip duplicate messageIds from SSE reconnect or bridge listener overlap.
+        self._dedup_max = 200
+        self._dedup_set: set[str] = set()
+        self._dedup_ring: list[str] = []
+
     @property
     def name(self) -> str:
         return "Zalo"
@@ -530,6 +535,18 @@ class ZaloAdapter(BasePlatformAdapter):
             return
         if m.get("isSelf"):
             return
+
+        # Dedup by messageId (catches SSE replay or duplicate bridge events).
+        msg_id = str(m.get("messageId") or "")
+        if msg_id:
+            if msg_id in self._dedup_set:
+                logger.debug("Zalo: dedup dropped duplicate message %s", msg_id)
+                return
+            self._dedup_set.add(msg_id)
+            self._dedup_ring.append(msg_id)
+            if len(self._dedup_ring) > self._dedup_max:
+                old = self._dedup_ring.pop(0)
+                self._dedup_set.discard(old)
 
         thread_id = str(m.get("threadId") or "")
         thread_type = m.get("threadType") or "user"  # "user" | "group"

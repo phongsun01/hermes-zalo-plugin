@@ -140,7 +140,29 @@ const RING_SIZE = 200;
 const ring = [];
 let nextEventId = 1;
 
+// Deduplication ring: skip message events whose messageId was already pushed
+// within the last ~200 messages (covers brief listener overlap during relogin).
+const DEDUP_SIZE = 200;
+const msgDedupSet = new Set();
+const msgDedupRing = [];
+
 function pushEvent(type, payload) {
+  // Never echo own messages back to the gateway adapter.
+  if (type === "message" && payload.isSelf) return;
+  // Dedup by messageId (catches rare duplicate pushes from listener overlap).
+  if (type === "message" && payload.messageId) {
+    if (msgDedupSet.has(payload.messageId)) {
+      console.log("[bridge] dedup: skipping duplicate message", payload.messageId);
+      return;
+    }
+    msgDedupSet.add(payload.messageId);
+    msgDedupRing.push(payload.messageId);
+    if (msgDedupRing.length > DEDUP_SIZE) {
+      const old = msgDedupRing.shift();
+      msgDedupSet.delete(old);
+    }
+  }
+
   const id = nextEventId++;
   const record = { id, type, payload };
   ring.push(record);
