@@ -519,6 +519,20 @@ export class ZaloClient extends EventEmitter {
       if (!api || typeof api.keepAlive !== "function") return;
       Promise.resolve()
         .then(() => api.keepAlive())
+        .then(() => {
+          // Refresh cookies after keepAlive — the server may have issued new ones.
+          const jar = api.getCookie?.();
+          if (jar) {
+            const serialized = jar.serializeSync?.()?.cookies ?? jar.toJSON?.()?.cookies;
+            if (serialized) {
+              const creds = this._loadCredentials();
+              if (creds) {
+                creds.cookie = serialized;
+                this._saveCredentials(creds);
+              }
+            }
+          }
+        })
         .catch((e) =>
           console.warn("[zalo] keepAlive failed:", e && e.message ? e.message : e),
         );
@@ -614,6 +628,7 @@ export class ZaloClient extends EventEmitter {
     listener.on("connected", () => {
       console.log("[zalo] listener connected");
       this.sessionDead = false;
+      this.loggedIn = true; // Restore after transient drops
       // A healthy connection replenishes the auto-relogin budget so periodic
       // drops don't slowly exhaust it over the session's lifetime.
       this._autoReloginAttempts = 0;
@@ -849,7 +864,22 @@ export class ZaloClient extends EventEmitter {
   // ── Outbound ──────────────────────────────────────────────────────────
 
   async sendText(threadId, threadType, text, mentions, quote) {
-    const content = { msg: String(text) };
+    // Strip all markdown formatting for plain text Zalo messages
+    const cleanText = String(text)
+      .replace(/\*\*(.+?)\*\*/g, "$1")       // **bold** -> bold
+      .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "$1") // *italic* -> italic
+      .replace(/__(.+?)__/g, "$1")           // __underline__ -> underline
+      .replace(/~~(.+?)~~/g, "$1")           // ~~strikethrough~~ -> strikethrough
+      .replace(/`{1,3}(.+?)`{1,3}/g, "$1")   // `code` -> code
+      .replace(/^#{1,6}\s+/gm, "")           // # headers -> plain
+      .replace(/^[-*+]\s+/gm, "")            // list items -> plain
+      .replace(/^\d+\.\s+/gm, "")            // numbered lists -> plain
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // [text](url) -> text
+      .replace(/^>\s+/gm, "")                // > blockquotes -> plain
+      .replace(/^---+$/gm, "")               // horizontal rules -> removed
+      .replace(/\n{3,}/g, "\n\n");           // normalize excessive newlines
+
+    const content = { msg: cleanText };
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
     return await this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType));
