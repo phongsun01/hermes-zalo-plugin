@@ -12,6 +12,8 @@
 
 import express from "express";
 import compression from "compression";
+import rateLimit from "express-rate-limit";
+import morgan from "morgan";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -51,6 +53,15 @@ const client = new ZaloClient({
     const n = parseInt(process.env.ZALO_INFO_MIN_INTERVAL_MS || "", 10);
     return Number.isFinite(n) ? n : 1500;
   })(),
+});
+
+// Rate Limiter: Prevent AI loop / spam from locking Zalo account (max 60 requests / minute)
+const apiSendLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.ZALO_RATE_LIMIT_MAX || "60", 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: "Quá nhiều request gửi tin nhắn, tạm thời bị giới hạn để bảo vệ tài khoản Zalo." },
 });
 
 // ── Access control: which zca-js actions are allowed ──────────────────────
@@ -102,8 +113,7 @@ function guardAction(method, res) {
 /** Utility wrapper for async routes (DRY error handling). */
 const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch((e) => {
-    const errorMsg = String(e && e.message ? e.message : e);
-    res.status(500).json({ error: errorMsg });
+    next(e);
   });
 };
 
@@ -200,8 +210,15 @@ client.on("group_event", (g) => pushEvent("group_event", g));
 
 // ── Express ─────────────────────────────────────────────────────────────
 const app = express();
+app.use(morgan("dev"));
 app.use(compression());
 app.use(express.json({ limit: "2mb" }));
+
+// Apply Rate Limiters on outbound sending routes
+app.use("/send", apiSendLimiter);
+app.use("/send-attachment", apiSendLimiter);
+app.use("/send-voice", apiSendLimiter);
+app.use("/api/", apiSendLimiter);
 
 // Action-policy middleware for the first-class routes (ROUTE_ACTION map above).
 // /api/<method> is gated inside its own handler; lifecycle routes
@@ -671,7 +688,16 @@ app.post("/api/:method", asyncHandler(async (req, res) => {
   const method = req.params.method;
   if (!guardAction(method, res)) return;
   const args = req.body && Array.isArray(req.body.args) ? req.body.args : [];
-  const result = await client.callRaw(method, args);
+
+  // Timeout guard (30s): Prevent malformed/hanging zca-js calls from keeping HTTP sockets open.
+  const CALL_TIMEOUT_MS = 30000;
+  const result = await Promise.race([
+    client.callRaw(method, args),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`zca-js call '${method}' timed out after 30s`)), CALL_TIMEOUT_MS)
+    ),
+  ]);
+
   res.json({ success: true, result: result ?? null });
 }));
 
@@ -686,6 +712,14 @@ app.post("/poll/create", asyncHandler(async (req, res) => {
   }
   res.json({ success: true, result: await client.createPoll(groupId, question, options, extra) });
 }));
+
+// Global Error Handler Middleware (Chốt chặn xử lý lỗi cuối cùng)
+app.use((err, req, res, next) => {
+  console.error(`[bridge] Express Error:`, err);
+  const status = err.status || err.statusCode || 500;
+  const message = err.message || "Internal Server Error";
+  res.status(status).json({ success: false, error: message });
+});
 
 async function main() {
   _httpServer = app.listen(PORT, HOST, () => {
