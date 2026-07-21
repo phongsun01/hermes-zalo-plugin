@@ -1221,15 +1221,36 @@ export class ZaloClient extends EventEmitter {
       pageCount++;
       let msgs;
       try {
-        // getGroupChatHistory(groupId, lastMsgId, count, lastMsgType)
-        // lastMsgId = undefined for first page; subsequent pages use the oldest msgId.
+        // Primary: zca-js getGroupChatHistory
         const args = lastMsgId !== undefined
           ? [String(groupId), String(lastMsgId), BATCH, 0]
           : [String(groupId), "0", BATCH, 0];
         msgs = await this.api.getGroupChatHistory(...args);
       } catch (e) {
-        log(`Error fetching history page ${pageCount}: ${e.message}`);
-        break;
+        log(`api.getGroupChatHistory failed on page ${pageCount} (${e.message}), trying loadmsg fallback...`);
+        try {
+          // Fallback: Direct call to Zalo loadmsg API using zca-js authenticated session context
+          const ctxHttp = this.api._ctx ? this.api._ctx.http : (this.api.ctx ? this.api.ctx.http : null);
+          if (ctxHttp && typeof ctxHttp.post === "function") {
+            const resp = await ctxHttp.post("https://wpa.chat.zalo.me/api/message/loadmsg", {
+              zpw_ver: 636,
+              zpw_type: 30,
+              params: {
+                threadId: String(groupId),
+                lastId: String(lastMsgId || "0"),
+                count: BATCH,
+                timestamp: 0,
+                type: 2, // 2 = group
+              },
+            });
+            msgs = resp.data?.data?.msgs ?? resp.data?.msgs ?? resp.data;
+          } else {
+            throw e;
+          }
+        } catch (fallbackErr) {
+          log(`Error fetching history page ${pageCount}: ${fallbackErr.message}`);
+          break;
+        }
       }
 
       const items = (msgs && (msgs.data || msgs)) || [];
