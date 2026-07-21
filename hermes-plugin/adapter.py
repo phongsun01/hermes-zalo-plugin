@@ -615,7 +615,8 @@ class ZaloAdapter(BasePlatformAdapter):
             )
 
         # B) Thread/group allowlist — empty = everywhere.
-        if self._allowed_threads and thread_id not in self._allowed_threads:
+        is_allowed_user_dm = (chat_type == "dm") and (not self._allowed_users or sender_id in self._allowed_users)
+        if self._allowed_threads and thread_id not in self._allowed_threads and not is_allowed_user_dm:
             logger.debug("Zalo: ignoring message in non-allowed thread %s", thread_id)
             return
 
