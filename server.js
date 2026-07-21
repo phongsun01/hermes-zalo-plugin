@@ -13,6 +13,7 @@
 import express from "express";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { ZaloClient } from "./zaloClient.js";
 import { ACTION_GROUPS, DEFAULT_GROUPS, ACTION_GROUP } from "./permissions.js";
@@ -97,6 +98,14 @@ function guardAction(method, res) {
   return true;
 }
 
+/** Utility wrapper for async routes (DRY error handling). */
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch((e) => {
+    const errorMsg = String(e && e.message ? e.message : e);
+    res.status(500).json({ error: errorMsg });
+  });
+};
+
 console.log(
   `[bridge] access policy: groups=[${[...ALLOWED_GROUPS].join(",")}]` +
     ` destructive=${ALLOW_DESTRUCTIVE}` +
@@ -138,7 +147,7 @@ const sseClients = new Set();
 // via Last-Event-ID (SSE standard).
 const RING_SIZE = 200;
 const ring = [];
-let nextEventId = 1;
+let nextEventId = Date.now() * 1000; // Monotonically increasing Event ID across restarts
 
 // Deduplication ring: skip message events whose messageId was already pushed
 // within the last ~200 messages (covers brief listener overlap during relogin).
@@ -207,7 +216,15 @@ function checkAuth(req, res) {
     req.get("x-bridge-token") ||
     (req.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
     req.query.token;
-  if (provided === TOKEN) return true;
+
+  const providedBuffer = Buffer.from(provided || "");
+  const tokenBuffer = Buffer.from(TOKEN);
+  if (
+    providedBuffer.length === tokenBuffer.length &&
+    crypto.timingSafeEqual(providedBuffer, tokenBuffer)
+  ) {
+    return true;
+  }
   res.status(401).json({ error: "unauthorized" });
   return false;
 }
@@ -259,7 +276,7 @@ app.get("/qr.png", (req, res) => {
 
 // Recover a dead/expired session: re-run login (QR by default). Returns once
 // a new QR is generated; poll /qr or /qr.png to scan it, then /health.
-app.post("/relogin", async (req, res) => {
+app.post("/relogin", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   const forceQR = req.body && req.body.forceQR === false ? false : true;
   // Kick off relogin in the background; respond immediately so the caller
@@ -269,40 +286,34 @@ app.post("/relogin", async (req, res) => {
     .then((r) => console.log("[bridge] relogin complete via", r.method))
     .catch((e) => console.error("[bridge] relogin failed:", e && e.message ? e.message : e));
   res.json({ success: true, message: "relogin started; poll /qr then /qr.png to scan" });
-});
+}));
 
 // Graceful shutdown of the bridge. Stops the listener, closes SSE + file
 // streams, then exits. Use to cleanly stop the Hermes Zalo agent.
-app.post("/shutdown", async (req, res) => {
+app.post("/shutdown", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   res.json({ success: true, message: "shutting down" });
   await gracefulShutdown("http /shutdown");
-});
+}));
 
 // SSE inbound stream. Sends a heartbeat every 15s to defeat idle timeouts.
 //
-// SINGLE-CLIENT ENFORCEMENT (HTTP 409 approach):
-// Docker Desktop proxy on Windows opens 2 TCP connections for 1 SSE request,
-// causing every event to be delivered twice → bot replies twice.
-//
-// Fix: if a SSE client is already connected, reject the new request with 409.
-// The adapter's _sse_loop treats 409 as a transient error (not 200) and backs
-// off before retrying. This avoids the death-spiral that eviction causes
-// (eviction → adapter gets 'close' → immediate reconnect → loop).
-//
-// The legitimate reconnect (after keepalive or bridge restart) will succeed
-// because by then the old client has already disconnected.
+// SINGLE-CLIENT ENFORCEMENT & EVICTION:
+// Docker Desktop proxy on Windows or reconnecting clients might leave TCP connections open.
+// Instead of rejecting (409), kick old connection(s) to allow new reconnection immediately.
 app.get("/events", (req, res) => {
   if (!checkAuth(req, res)) return;
 
-  // Reject if a client is already connected — prevents Docker Desktop's
-  // phantom second TCP connection from receiving duplicate events.
   if (sseClients.size >= 1) {
-    console.log("[bridge] SSE rejected (already have %d client) — returning 409", sseClients.size);
-    try {
-      res.status(409).json({ error: "SSE client already connected; retry after current client disconnects" });
-    } catch { /* socket may already be closed */ }
-    return;
+    console.log("[bridge] Kicking old SSE client(s) to accept new connection.");
+    for (const oldRes of sseClients) {
+      try {
+        oldRes.end();
+      } catch {
+        /* ignore */
+      }
+    }
+    sseClients.clear();
   }
 
   res.writeHead(200, {
@@ -353,23 +364,19 @@ function requireLogin(res) {
 // Send text. Body: { threadId, threadType, text, mentions?, quote? }
 //   mentions: [{ pos, uid, len }]  — group @mention
 //   quote:    SendMessageQuote captured from an inbound message (reply)
-app.post("/send", async (req, res) => {
+app.post("/send", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", text, mentions, quote } = req.body || {};
   if (!threadId || text == null) {
     return res.status(400).json({ error: "threadId and text required" });
   }
-  try {
-    const r = await client.sendText(threadId, threadType, text, mentions, quote);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const r = await client.sendText(threadId, threadType, text, mentions, quote);
+  res.json({ success: true, result: r });
+}));
 
 // Send attachment(s) by local file path(s). Body: { threadId, threadType, paths|path, caption? }
-app.post("/send-attachment", async (req, res) => {
+app.post("/send-attachment", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", caption } = req.body || {};
@@ -380,285 +387,196 @@ app.post("/send-attachment", async (req, res) => {
   for (const p of paths) {
     if (!fs.existsSync(p)) return res.status(400).json({ error: `file not found: ${p}` });
   }
-  try {
-    const r = await client.sendAttachment(threadId, threadType, paths, caption);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const r = await client.sendAttachment(threadId, threadType, paths, caption);
+  res.json({ success: true, result: r });
+}));
 
 // Send sticker. Body: { threadId, threadType, sticker: { id, cateId, type } }
-app.post("/send-sticker", async (req, res) => {
+app.post("/send-sticker", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", sticker } = req.body || {};
   if (!threadId || !sticker) return res.status(400).json({ error: "threadId and sticker required" });
-  try {
-    const r = await client.sendSticker(threadId, threadType, sticker);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const r = await client.sendSticker(threadId, threadType, sticker);
+  res.json({ success: true, result: r });
+}));
 
 // Send voice. Body: { threadId, threadType, voiceUrl } OR { ..., path } (local file → real voice bubble)
-app.post("/send-voice", async (req, res) => {
+app.post("/send-voice", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", voiceUrl, path: filePath } = req.body || {};
   if (!threadId || (!voiceUrl && !filePath)) {
     return res.status(400).json({ error: "threadId and (voiceUrl or path) required" });
   }
-  try {
-    let r;
-    if (filePath) {
-      if (!fs.existsSync(filePath)) return res.status(400).json({ error: `file not found: ${filePath}` });
-      r = await client.sendVoiceLocal(threadId, threadType, filePath);
-    } else {
-      r = await client.sendVoice(threadId, threadType, voiceUrl);
-    }
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
+  let r;
+  if (filePath) {
+    if (!fs.existsSync(filePath)) return res.status(400).json({ error: `file not found: ${filePath}` });
+    r = await client.sendVoiceLocal(threadId, threadType, filePath);
+  } else {
+    r = await client.sendVoice(threadId, threadType, voiceUrl);
   }
-});
+  res.json({ success: true, result: r });
+}));
 
 // Typing indicator. Body: { threadId, threadType }
-app.post("/typing", async (req, res) => {
+app.post("/typing", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user" } = req.body || {};
   if (!threadId) return res.status(400).json({ error: "threadId required" });
   await client.sendTyping(threadId, threadType);
   res.json({ success: true });
-});
+}));
 
 // Chat info. GET /chat-info?threadId=..&threadType=user|group
-app.get("/chat-info", async (req, res) => {
+app.get("/chat-info", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const threadId = req.query.threadId;
   const threadType = req.query.threadType || "user";
   if (!threadId) return res.status(400).json({ error: "threadId required" });
-  try {
-    if (threadType === "group") {
-      const info = await client.getGroupInfo(threadId);
-      res.json({ threadId, type: "group", info });
-    } else {
-      const info = await client.getUserInfo(threadId);
-      res.json({ threadId, type: "user", info });
-    }
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
+  if (threadType === "group") {
+    const info = await client.getGroupInfo(threadId);
+    res.json({ threadId, type: "group", info });
+  } else {
+    const info = await client.getUserInfo(threadId);
+    res.json({ threadId, type: "user", info });
   }
-});
+}));
 
 // Search stickers by keyword. GET /stickers?keyword=hi&limit=5
-app.get("/stickers", async (req, res) => {
+app.get("/stickers", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const keyword = req.query.keyword;
   const limit = parseInt(req.query.limit || "5", 10);
   if (!keyword) return res.status(400).json({ error: "keyword required" });
-  try {
-    const stickers = await client.findStickers(keyword, limit);
-    res.json({ success: true, stickers });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const stickers = await client.findStickers(keyword, limit);
+  res.json({ success: true, stickers });
+}));
 
 // ── Reactions / undo / reply / mention ───────────────────────────────────
 
 // React to a message. Body: { threadId, threadType, msgId, cliMsgId?, icon }
 // icon = a Reactions key (HEART, LIKE, HAHA, WOW, CRY, ANGRY, …) or raw icon string.
-app.post("/react", async (req, res) => {
+app.post("/react", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", msgId, cliMsgId, icon = "HEART" } = req.body || {};
   if (!threadId || !msgId) return res.status(400).json({ error: "threadId and msgId required" });
-  try {
-    const r = await client.react(threadId, threadType, msgId, cliMsgId, icon);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const r = await client.react(threadId, threadType, msgId, cliMsgId, icon);
+  res.json({ success: true, result: r });
+}));
 
 // Recall/undo own message. Body: { threadId, threadType, msgId, cliMsgId? }
-app.post("/undo", async (req, res) => {
+app.post("/undo", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", msgId, cliMsgId } = req.body || {};
   if (!threadId || !msgId) return res.status(400).json({ error: "threadId and msgId required" });
-  try {
-    const r = await client.undo(threadId, threadType, msgId, cliMsgId);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-
-// /send already supports reply + mention via optional body fields:
-//   mentions: [{ pos, uid, len }]   (group @mention)
-//   quote:    a SendMessageQuote object captured from an inbound message
+  const r = await client.undo(threadId, threadType, msgId, cliMsgId);
+  res.json({ success: true, result: r });
+}));
 
 // Send a contact card (danh thiếp). Body: { threadId, threadType, userId, phoneNumber? }
-app.post("/send-card", async (req, res) => {
+app.post("/send-card", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { threadId, threadType = "user", userId, phoneNumber } = req.body || {};
   if (!threadId || !userId) return res.status(400).json({ error: "threadId and userId required" });
-  try {
-    const r = await client.sendCard(threadId, threadType, userId, phoneNumber);
-    res.json({ success: true, result: r });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const r = await client.sendCard(threadId, threadType, userId, phoneNumber);
+  res.json({ success: true, result: r });
+}));
 
 // ── Friends ───────────────────────────────────────────────────────────────
-app.post("/friend/request", async (req, res) => {
+app.post("/friend/request", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { userId, msg } = req.body || {};
   if (!userId) return res.status(400).json({ error: "userId required" });
-  try {
-    res.json({ success: true, result: await client.sendFriendRequest(userId, msg) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/friend/accept", async (req, res) => {
+  res.json({ success: true, result: await client.sendFriendRequest(userId, msg) });
+}));
+app.post("/friend/accept", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ error: "userId required" });
-  try {
-    res.json({ success: true, result: await client.acceptFriendRequest(userId) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/friend/reject", async (req, res) => {
+  res.json({ success: true, result: await client.acceptFriendRequest(userId) });
+}));
+app.post("/friend/reject", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { userId } = req.body || {};
   if (!userId) return res.status(400).json({ error: "userId required" });
-  try {
-    res.json({ success: true, result: await client.rejectFriendRequest(userId) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.get("/friends", async (req, res) => {
+  res.json({ success: true, result: await client.rejectFriendRequest(userId) });
+}));
+app.get("/friends", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  try {
-    res.json({ success: true, friends: await client.getAllFriends() });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.get("/find-user", async (req, res) => {
+  res.json({ success: true, friends: await client.getAllFriends() });
+}));
+app.get("/find-user", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const phone = req.query.phone;
   if (!phone) return res.status(400).json({ error: "phone required" });
-  try {
-    res.json({ success: true, user: await client.findUser(phone) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  res.json({ success: true, user: await client.findUser(phone) });
+}));
 
 // ── Groups ────────────────────────────────────────────────────────────────
-app.get("/groups", async (req, res) => {
+app.get("/groups", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  try {
-    res.json({ success: true, groups: await client.getAllGroups() });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-// Friendly id+name list of groups and friends, for the setup wizard.
-app.get("/contacts", async (req, res) => {
+  res.json({ success: true, groups: await client.getAllGroups() });
+}));
+app.get("/contacts", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  try {
-    res.json({ success: true, ...(await client.listContacts()) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/create", async (req, res) => {
+  res.json({ success: true, ...(await client.listContacts()) });
+}));
+app.post("/group/create", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { name, members } = req.body || {};
   if (!Array.isArray(members) || !members.length) return res.status(400).json({ error: "members[] required" });
-  try {
-    res.json({ success: true, result: await client.createGroup(name, members) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/add", async (req, res) => {
+  res.json({ success: true, result: await client.createGroup(name, members) });
+}));
+app.post("/group/add", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, members } = req.body || {};
   if (!groupId || !Array.isArray(members) || !members.length) return res.status(400).json({ error: "groupId and members[] required" });
-  try {
-    res.json({ success: true, result: await client.addUserToGroup(groupId, members) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/remove", async (req, res) => {
+  res.json({ success: true, result: await client.addUserToGroup(groupId, members) });
+}));
+app.post("/group/remove", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, members } = req.body || {};
   if (!groupId || !Array.isArray(members) || !members.length) return res.status(400).json({ error: "groupId and members[] required" });
-  try {
-    res.json({ success: true, result: await client.removeUserFromGroup(groupId, members) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/rename", async (req, res) => {
+  res.json({ success: true, result: await client.removeUserFromGroup(groupId, members) });
+}));
+app.post("/group/rename", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, name } = req.body || {};
   if (!groupId || !name) return res.status(400).json({ error: "groupId and name required" });
-  try {
-    res.json({ success: true, result: await client.changeGroupName(groupId, name) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/deputy", async (req, res) => {
+  res.json({ success: true, result: await client.changeGroupName(groupId, name) });
+}));
+app.post("/group/deputy", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, members } = req.body || {};
   if (!groupId || !Array.isArray(members) || !members.length) return res.status(400).json({ error: "groupId and members[] required" });
-  try {
-    res.json({ success: true, result: await client.addGroupDeputy(groupId, members) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
-app.post("/group/leave", async (req, res) => {
+  res.json({ success: true, result: await client.addGroupDeputy(groupId, members) });
+}));
+app.post("/group/leave", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, silent } = req.body || {};
   if (!groupId) return res.status(400).json({ error: "groupId required" });
-  try {
-    res.json({ success: true, result: await client.leaveGroup(groupId, silent) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  res.json({ success: true, result: await client.leaveGroup(groupId, silent) });
+}));
 
 // ── Group image bulk-download ─────────────────────────────────────────────
 // POST /group/download-images
@@ -666,12 +584,12 @@ app.post("/group/leave", async (req, res) => {
 // Returns immediately { ok: true, jobId } and sends SSE events:
 //   download_progress  { jobId, downloaded, skipped, errors, done, savePath, message }
 const DEFAULT_IMAGE_SAVE_PATH =
-  process.env.ZALO_IMAGE_SAVE_PATH || "D:\\ZaloImages";
+  process.env.ZALO_IMAGE_SAVE_PATH || path.join(process.cwd(), "data", "group_images");
 
 // Active download jobs (jobId → { groupId, cancel: false })
 const _downloadJobs = new Map();
 
-app.post("/group/download-images", async (req, res) => {
+app.post("/group/download-images", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
 
@@ -690,7 +608,7 @@ app.post("/group/download-images", async (req, res) => {
   }
 
   const jobId = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const savePath = `${DEFAULT_IMAGE_SAVE_PATH}\\${groupId}`;
+  const savePath = path.join(DEFAULT_IMAGE_SAVE_PATH, String(groupId));
   const job = { groupId, cancel: false };
   _downloadJobs.set(jobId, job);
 
@@ -735,7 +653,7 @@ app.post("/group/download-images", async (req, res) => {
   })();
 
   res.json({ ok: true, jobId, savePath, message: "Download job started" });
-});
+}));
 
 // ── Generic passthrough: call ANY zca-js API method ───────────────────────
 
@@ -744,35 +662,27 @@ app.post("/group/download-images", async (req, res) => {
 // getGroupMembersInfo, reminders, mute/pin, profile, business, etc.).
 // Pass args positionally exactly as zca-js expects; use "user"/"group" where
 // a ThreadType is needed (auto-converted). Returns { success, result }.
-app.post("/api/:method", async (req, res) => {
+app.post("/api/:method", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const method = req.params.method;
   if (!guardAction(method, res)) return;
-  const args = (req.body && req.body.args) || [];
-  try {
-    const result = await client.callRaw(method, args);
-    res.json({ success: true, result: result ?? null });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  const args = req.body && Array.isArray(req.body.args) ? req.body.args : [];
+  const result = await client.callRaw(method, args);
+  res.json({ success: true, result: result ?? null });
+}));
 
 // ── Poll ──────────────────────────────────────────────────────────────────
 // Body: { groupId, question, options[], expiredTime?, allowMultiChoices?, ... }
-app.post("/poll/create", async (req, res) => {
+app.post("/poll/create", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
   const { groupId, question, options, ...extra } = req.body || {};
   if (!groupId || !question || !Array.isArray(options) || options.length < 2) {
     return res.status(400).json({ error: "groupId, question and options[>=2] required" });
   }
-  try {
-    res.json({ success: true, result: await client.createPoll(groupId, question, options, extra) });
-  } catch (e) {
-    res.status(500).json({ error: String(e && e.message ? e.message : e) });
-  }
-});
+  res.json({ success: true, result: await client.createPoll(groupId, question, options, extra) });
+}));
 
 async function main() {
   _httpServer = app.listen(PORT, HOST, () => {
