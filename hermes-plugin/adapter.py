@@ -442,7 +442,9 @@ class ZaloAdapter(BasePlatformAdapter):
             except Exception as e:
                 if self._stop:
                     break
-                logger.warning("Zalo: SSE disconnected (%s); reconnecting in %.1fs", e, backoff)
+                logger.warning("Zalo: SSE disconnected (%s); resetting event ID & reconnecting in %.1fs", e, backoff)
+                # Reset last_event_id on drop to avoid SSE replay mismatch if bridge restarted
+                self._last_event_id = None
                 # During backoff, poll /health every 2s so we reconnect ASAP
                 # when the bridge comes back, instead of waiting for full backoff.
                 await self._wait_with_health_poll(backoff)
@@ -797,7 +799,7 @@ class ZaloAdapter(BasePlatformAdapter):
             return None, MessageType.TEXT
         try:
             async with self._session.get(
-                url, timeout=aiohttp.ClientTimeout(total=120)
+                url, timeout=aiohttp.ClientTimeout(total=30, sock_read=25)
             ) as resp:
                 if resp.status != 200:
                     logger.warning("Zalo: media download failed (%s) for %s", resp.status, kind)
@@ -917,13 +919,13 @@ class ZaloAdapter(BasePlatformAdapter):
             if res.get("error"):
                 return SendResult(success=False, error=res["error"])
             last = res
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.5)  # Optimization: 0.5s pause to prevent Zalo rate-limit / spam detection
         msg_id = None
         if isinstance(last, dict):
             result = last.get("result")
             if isinstance(result, dict):
                 # zca-js returns { message: { msgId }, attachment: [...] }
-                msg = result.get("message")
+                msg = result.get("msg") or result.get("message")
                 if isinstance(msg, dict) and msg.get("msgId") is not None:
                     msg_id = str(msg.get("msgId"))
                 elif result.get("msgId") is not None:
@@ -962,23 +964,21 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
         thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        body = {"threadId": chat_id, "threadType": thread_type}
         if str(audio_path).startswith(("http://", "https://")):
-            # A public m4a URL → real voice bubble via zca-js sendVoice.
-            res = await self._post(
-                "/send-voice",
-                {"threadId": chat_id, "threadType": thread_type, "voiceUrl": audio_path},
+            body["voiceUrl"] = audio_path
+        else:
+            body["path"] = audio_path
+
+        res = await self._post("/send-voice", body)
+        if res.get("error"):
+            # Fallback to /send-attachment if /send-voice fails
+            res2 = await self._post(
+                "/send-attachment",
+                {"threadId": chat_id, "threadType": thread_type, "path": audio_path},
             )
-            if not res.get("error"):
-                return SendResult(success=True)
-        # Local audio file (or voiceUrl failed) → send as a playable file
-        # attachment. zca-js sendVoice can't reliably HEAD the upload URL, so
-        # we don't force a voice bubble for local files.
-        res2 = await self._post(
-            "/send-attachment",
-            {"threadId": chat_id, "threadType": thread_type, "path": audio_path},
-        )
-        if res2.get("error"):
-            return SendResult(success=False, error=res2["error"])
+            if res2.get("error"):
+                return SendResult(success=False, error=res2["error"])
         return SendResult(success=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -1228,7 +1228,9 @@ def _pick_ids(items: List[Dict[str, Any]], label: str, prompt_fn, print_fn) -> s
             return
         for i, it in enumerate(lst, 1):
             mark = "✓" if str(it.get("id", "")) in selected else " "
-            print_fn(f"   [{mark}] {i}. {it.get('name','?')}  ({it.get('id','')})")
+            raw_name = str(it.get("name") or "?")
+            name = (raw_name[:47] + "...") if len(raw_name) > 50 else raw_name
+            print_fn(f"   [{mark}] {i}. {name}  ({it.get('id','')})")
 
     _render(shown)
     while True:
@@ -1261,7 +1263,9 @@ def _pick_ids(items: List[Dict[str, Any]], label: str, prompt_fn, print_fn) -> s
                 idx = int(t) - 1
                 if 0 <= idx < len(shown):
                     it = shown[idx]
-                    selected[str(it.get("id", ""))] = it.get("name", it.get("id", ""))
+                    raw_name = str(it.get("name") or it.get("id") or "")
+                    name = (raw_name[:47] + "...") if len(raw_name) > 50 else raw_name
+                    selected[str(it.get("id", ""))] = name
             print_fn("   Selected: " + (", ".join(selected.values()) or "(none)"))
             continue
         # Otherwise treat as a search query over names.
