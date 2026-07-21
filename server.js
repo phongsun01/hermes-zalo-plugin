@@ -280,8 +280,31 @@ app.post("/shutdown", async (req, res) => {
 });
 
 // SSE inbound stream. Sends a heartbeat every 15s to defeat idle timeouts.
+//
+// SINGLE-CLIENT ENFORCEMENT (HTTP 409 approach):
+// Docker Desktop proxy on Windows opens 2 TCP connections for 1 SSE request,
+// causing every event to be delivered twice → bot replies twice.
+//
+// Fix: if a SSE client is already connected, reject the new request with 409.
+// The adapter's _sse_loop treats 409 as a transient error (not 200) and backs
+// off before retrying. This avoids the death-spiral that eviction causes
+// (eviction → adapter gets 'close' → immediate reconnect → loop).
+//
+// The legitimate reconnect (after keepalive or bridge restart) will succeed
+// because by then the old client has already disconnected.
 app.get("/events", (req, res) => {
   if (!checkAuth(req, res)) return;
+
+  // Reject if a client is already connected — prevents Docker Desktop's
+  // phantom second TCP connection from receiving duplicate events.
+  if (sseClients.size >= 1) {
+    console.log("[bridge] SSE rejected (already have %d client) — returning 409", sseClients.size);
+    try {
+      res.status(409).json({ error: "SSE client already connected; retry after current client disconnects" });
+    } catch { /* socket may already be closed */ }
+    return;
+  }
+
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
@@ -303,6 +326,7 @@ app.get("/events", (req, res) => {
   }
 
   sseClients.add(res);
+  console.log("[bridge] SSE client connected, total:", sseClients.size);
   const heartbeat = setInterval(() => {
     try {
       res.write(`: ping\n\n`);
@@ -314,6 +338,7 @@ app.get("/events", (req, res) => {
   req.on("close", () => {
     clearInterval(heartbeat);
     sseClients.delete(res);
+    console.log("[bridge] SSE client disconnected, total:", sseClients.size);
   });
 });
 
@@ -635,7 +660,85 @@ app.post("/group/leave", async (req, res) => {
   }
 });
 
+// ── Group image bulk-download ─────────────────────────────────────────────
+// POST /group/download-images
+// Body: { groupId, fromDate? }   fromDate = "DD/MM/YYYY" or omit for all images
+// Returns immediately { ok: true, jobId } and sends SSE events:
+//   download_progress  { jobId, downloaded, skipped, errors, done, savePath, message }
+const DEFAULT_IMAGE_SAVE_PATH =
+  process.env.ZALO_IMAGE_SAVE_PATH || "D:\\ZaloImages";
+
+// Active download jobs (jobId → { groupId, cancel: false })
+const _downloadJobs = new Map();
+
+app.post("/group/download-images", async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  if (!requireLogin(res)) return;
+
+  const { groupId, fromDate } = req.body || {};
+  if (!groupId) return res.status(400).json({ error: "groupId required" });
+
+  // Parse optional date filter "DD/MM/YYYY".
+  let fromTs = null;
+  if (fromDate) {
+    const m = String(fromDate).match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+    if (!m) return res.status(400).json({ error: "fromDate must be DD/MM/YYYY" });
+    const [, dd, mm, yyyy] = m;
+    const d = new Date(`${yyyy}-${mm.padStart(2, "0")}-${dd.padStart(2, "0")}T00:00:00+07:00`);
+    if (isNaN(d.getTime())) return res.status(400).json({ error: "invalid fromDate" });
+    fromTs = d.getTime();
+  }
+
+  const jobId = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const savePath = `${DEFAULT_IMAGE_SAVE_PATH}\\${groupId}`;
+  const job = { groupId, cancel: false };
+  _downloadJobs.set(jobId, job);
+
+  const emit = (payload) =>
+    pushEvent("download_progress", { jobId, groupId, savePath, ...payload });
+
+  // Kick off in background (no await).
+  (async () => {
+    try {
+      emit({ done: false, message: fromTs
+        ? `Bắt đầu tải ảnh từ ${fromDate}...`
+        : "Bắt đầu quét toàn bộ lịch sử group..."
+      });
+
+      const result = await client.downloadGroupImages(String(groupId), {
+        savePath,
+        fromTs,
+        onProgress: (downloaded, skipped, errors) => {
+          emit({ done: false, downloaded, skipped, errors,
+            message: `Đã tải ${downloaded} ảnh...` });
+        },
+        onStatus: (msg) => {
+          console.log(`[job:${jobId}] ${msg}`);
+        },
+      });
+
+      emit({
+        done: true,
+        downloaded: result.downloaded,
+        skipped: result.skipped,
+        errors: result.errors,
+        message: `✅ Xong! Đã tải ${result.downloaded} ảnh về ${savePath}` +
+          (result.errors ? ` (${result.errors} lỗi)` : ""),
+      });
+    } catch (e) {
+      console.error(`[job:${jobId}] error:`, e && e.message ? e.message : e);
+      emit({ done: true, downloaded: 0, skipped: 0, errors: 1,
+        message: `❌ Lỗi tải ảnh: ${e && e.message ? e.message : e}` });
+    } finally {
+      _downloadJobs.delete(jobId);
+    }
+  })();
+
+  res.json({ ok: true, jobId, savePath, message: "Download job started" });
+});
+
 // ── Generic passthrough: call ANY zca-js API method ───────────────────────
+
 // POST /api/<method>  body { args: [...] }
 // Covers the full zca-js surface (forwardMessage, deleteMessage, sendVideo,
 // getGroupMembersInfo, reminders, mute/pin, profile, business, etc.).
@@ -718,5 +821,14 @@ async function gracefulShutdown(reason) {
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// Prevent the bridge process from crashing on unhandled errors.
+// The watchdog will restart it if needed, but we want to stay up for transient errors.
+process.on("uncaughtException", (err) => {
+  console.error("[bridge] uncaughtException (staying up):", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[bridge] unhandledRejection (staying up):", reason);
+});
 
 main();

@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -295,6 +296,9 @@ class ZaloAdapter(BasePlatformAdapter):
         self._dedup_set: set[str] = set()
         self._dedup_ring: list[str] = []
 
+        # Tracks in-flight /zl taianh jobs: groupId → reply thread_id.
+        self._download_reply_map: Dict[str, str] = {}
+
     @property
     def name(self) -> str:
         return "Zalo"
@@ -327,27 +331,42 @@ class ZaloAdapter(BasePlatformAdapter):
         self._session = aiohttp.ClientSession()
 
         # Probe bridge health and login state.
-        try:
-            async with self._session.get(
-                f"{self.bridge_url}/health", timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
-        except Exception as e:
-            logger.error("Zalo: cannot reach bridge at %s — %s", self.bridge_url, e)
-            await self._close_session()
-            self._set_fatal_error("bridge_unreachable", f"Bridge unreachable: {e}", retryable=True)
-            return False
+        # Retry a few times if bridge is reachable but not yet logged in
+        # (zca-js auto-relogin may still be in progress after a transient drop).
+        MAX_LOGIN_RETRIES = 12  # ~60s total with 5s polling
+        login_retry = 0
+        while login_retry < MAX_LOGIN_RETRIES:
+            try:
+                async with self._session.get(
+                    f"{self.bridge_url}/health", timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    data = await resp.json()
+            except Exception as e:
+                logger.error("Zalo: cannot reach bridge at %s — %s", self.bridge_url, e)
+                await self._close_session()
+                self._set_fatal_error("bridge_unreachable", f"Bridge unreachable: {e}", retryable=True)
+                return False
 
-        if not data.get("loggedIn"):
-            qr = data.get("qr")
-            msg = (
-                "Zalo plugin is running but not logged in. "
-                f"Scan the QR (bridge state: {qr}). See {self.bridge_url}/qr.png"
-            )
-            logger.error("Zalo: %s", msg)
-            await self._close_session()
-            self._set_fatal_error("not_logged_in", msg, retryable=True)
-            return False
+            if data.get("loggedIn"):
+                break  # bridge is ready
+
+            login_retry += 1
+            if login_retry < MAX_LOGIN_RETRIES:
+                logger.info(
+                    "Zalo: bridge not logged in yet (attempt %d/%d); waiting 5s...",
+                    login_retry, MAX_LOGIN_RETRIES,
+                )
+                await asyncio.sleep(5)
+            else:
+                qr = data.get("qr")
+                msg = (
+                    "Zalo plugin is running but not logged in. "
+                    f"Scan the QR (bridge state: {qr}). See {self.bridge_url}/qr.png"
+                )
+                logger.error("Zalo: %s", msg)
+                await self._close_session()
+                self._set_fatal_error("not_logged_in", msg, retryable=True)
+                return False
 
         self._own_id = str(data.get("ownId") or "") or None
 
@@ -424,8 +443,10 @@ class ZaloAdapter(BasePlatformAdapter):
                 if self._stop:
                     break
                 logger.warning("Zalo: SSE disconnected (%s); reconnecting in %.1fs", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+                # During backoff, poll /health every 2s so we reconnect ASAP
+                # when the bridge comes back, instead of waiting for full backoff.
+                await self._wait_with_health_poll(backoff)
+                backoff = min(backoff * 2, 10.0)
 
     async def _consume_sse(self, resp) -> None:
         event_type = "message"
@@ -478,6 +499,9 @@ class ZaloAdapter(BasePlatformAdapter):
         if event_type == "message":
             await self._on_inbound_message(data)
             return
+        if event_type == "download_progress":
+            await self._on_download_progress(data)
+            return
         # Reaction / undo / friend / group events: surface as a synthetic
         # context line for the agent (no media). These don't trigger a turn by
         # default unless a handler wants them; we log + optionally dispatch.
@@ -529,6 +553,30 @@ class ZaloAdapter(BasePlatformAdapter):
                     await self.handle_message(ev)
                 except Exception:
                     pass
+
+    async def _wait_with_health_poll(self, max_wait: float) -> None:
+        """Wait up to `max_wait` seconds, polling /health every 2s.
+
+        If the bridge becomes reachable we cut the wait short so the SSE
+        reconnect happens sooner.
+        """
+        import aiohttp
+        slept = 0.0
+        while slept < max_wait:
+            remaining = max_wait - slept
+            chunk = min(2.0, remaining)
+            await asyncio.sleep(chunk)
+            slept += chunk
+            try:
+                async with self._session.get(
+                    f"{self.bridge_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                    headers={"x-bridge-token": self.bridge_token} if self.bridge_token else {},
+                ) as resp:
+                    if resp.status == 200:
+                        return  # bridge is up, reconnect now
+            except Exception:
+                pass  # bridge still down
 
     async def _on_inbound_message(self, m: Dict[str, Any]) -> None:
         if not self._message_handler:
@@ -595,6 +643,28 @@ class ZaloAdapter(BasePlatformAdapter):
             user_name=sender_name,
         )
 
+        # ── /zl taianh — group image bulk-download (no AI turn) ───────────
+        # Triggers:  /zl taianh            → download all images in this group
+        #            /zl taianh DD/MM/YYYY  → download images from that date onward
+        zl_result = self._parse_zl_taianh(text)
+        if zl_result is not None:
+            # Only works in group context.
+            if chat_type == "group":
+                asyncio.create_task(
+                    self._handle_zl_taianh(
+                        group_id=thread_id,
+                        thread_type="group",
+                        reply_to=thread_id,
+                        from_date=zl_result,
+                    )
+                )
+            else:
+                asyncio.create_task(
+                    self._bridge_send(thread_id, "group",
+                        "⚠️ Lệnh /zl taianh chỉ dùng trong nhóm.")
+                )
+            return
+
         # Download inbound media so the agent can see/hear it.
         media_urls: List[str] = []
         media_types: List[str] = []
@@ -618,6 +688,101 @@ class ZaloAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         await self.handle_message(event)
+
+    # ── /zl taianh command ────────────────────────────────────────────────────
+
+    def _parse_zl_taianh(self, text: str) -> Optional[str]:
+        """Return the from-date string ("DD/MM/YYYY") if text matches a
+        /zl taianh command, "" if it's an all-images request, or None if
+        the text is not a /zl taianh command at all.
+
+        Accepted patterns (case-insensitive, Vietnamese diacritics allowed):
+          /zl taianh
+          /zl taianh 24/11/2026
+          tải hết ảnh trong group
+          tải ảnh trong group từ ngày 24/11/2026
+        """
+        t = (text or "").strip()
+        if not t:
+            return None
+
+        # Normalise diacritics for matching.
+        import unicodedata
+        def _norm(s):
+            s = unicodedata.normalize("NFD", s)
+            s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+            return s.replace("đ", "d").replace("Đ", "D").lower()
+
+        n = _norm(t)
+        DATE_PAT = r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{4})"
+
+        # /zl taianh [date]
+        m = re.match(r"^/zl\s+taianh(?:\s+" + DATE_PAT + r")?\s*$", n)
+        if m:
+            return m.group(1) or ""
+
+        # Natural language: "tải hết ảnh trong group"
+        if re.search(r"tai\s+het\s+anh\b", n) or re.search(r"tai\s+anh\s+trong\s+group\b", n):
+            dm = re.search(DATE_PAT, t)  # search original for correct date
+            return dm.group(1) if dm else ""
+
+        # "tải ảnh trong group từ ngày DD/MM/YYYY"
+        m2 = re.search(r"tai\s+anh.*tu\s+ngay\s+" + DATE_PAT, n)
+        if m2:
+            dm2 = re.search(DATE_PAT, t)
+            return dm2.group(1) if dm2 else ""
+
+        return None
+
+    async def _bridge_send(self, thread_id: str, thread_type: str, text: str) -> None:
+        """Fire-and-forget: send a text message directly to the bridge."""
+        await self._post("/send", {"threadId": thread_id, "threadType": thread_type, "text": text})
+
+
+
+    async def _handle_zl_taianh(
+        self, group_id: str, thread_type: str, reply_to: str, from_date: str
+    ) -> None:
+        """Call POST /group/download-images on the bridge and acknowledge."""
+        if from_date:
+            ack = f"📥 Đang tải ảnh trong group từ ngày {from_date}...\nTôi sẽ báo khi xong!"
+        else:
+            ack = "📥 Đang tải toàn bộ ảnh trong group...\nTôi sẽ báo khi xong (có thể mất vài phút)!"
+        await self._bridge_send(reply_to, thread_type, ack)
+        self._download_reply_map[group_id] = reply_to
+
+        body: Dict[str, Any] = {"groupId": group_id}
+        if from_date:
+            body["fromDate"] = from_date
+        result = await self._post("/group/download-images", body)
+        if result.get("error"):
+            await self._bridge_send(reply_to, thread_type,
+                f"❌ Lỗi khởi động job tải ảnh: {result['error']}")
+            self._download_reply_map.pop(group_id, None)
+
+    async def _on_download_progress(self, data: Dict[str, Any]) -> None:
+        """Forward SSE download_progress events back to the originating group."""
+        group_id = str(data.get("groupId") or "")
+        reply_to = self._download_reply_map.get(group_id)
+        if not reply_to:
+            return
+        msg = data.get("message") or ""
+        done = data.get("done", False)
+        if done:
+            save_path = data.get("savePath", "")
+            downloaded = data.get("downloaded", 0)
+            errors = data.get("errors", 0)
+            full_msg = msg or (
+                f"✅ Xong! Đã tải {downloaded} ảnh về {save_path}"
+                + (f" ({errors} lỗi)" if errors else "")
+            )
+            await self._bridge_send(reply_to, "group", full_msg)
+            self._download_reply_map.pop(group_id, None)
+        else:
+            # Only forward occasional progress updates (every 10 images) to avoid spam.
+            downloaded = data.get("downloaded", 0)
+            if downloaded and downloaded % 10 == 0:
+                await self._bridge_send(reply_to, "group", msg)
 
     async def _download_media(self, media: Dict[str, Any]) -> tuple[Optional[str], "MessageType"]:
         """Download a media URL to the Hermes cache. Returns (path, MessageType)."""

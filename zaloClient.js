@@ -502,6 +502,26 @@ export class ZaloClient extends EventEmitter {
     console.log("[zalo] logged in. ownId =", this.ownId);
     this._wireListeners();
     // retryOnClose: zca-js auto-reconnects the Zalo websocket on drop.
+    // Inject code 1000 + 1006 into zca-js retry system so WS reconnects
+    // internally (no API call) for both normal close and abnormal close.
+    // code 1000 = Zalo server normal closure every ~6s
+    // code 1006 = abnormal closure (network glitch) — retry every 2s, up to 999x
+    const listener = this.api.listener;
+    if (listener && listener.ctx?.settings?.features?.socket) {
+      const codes = listener.ctx.settings.features.socket.close_and_retry_codes;
+      if (!codes.includes(1000)) codes.push(1000);
+      if (!codes.includes(1006)) codes.push(1006);
+      if (!listener.retryCount["1000"]) {
+        listener.retryCount["1000"] = {
+          count: 0, max: 999, times: [1000],
+        };
+      }
+      if (!listener.retryCount["1006"]) {
+        listener.retryCount["1006"] = {
+          count: 0, max: 999, times: [2000],
+        };
+      }
+    }
     this.api.listener.start({ retryOnClose: true });
     this._startKeepAlive();
   }
@@ -647,6 +667,8 @@ export class ZaloClient extends EventEmitter {
       // Anything else (cookie/network) gets an automatic cookie relogin first.
       console.log("[zalo] listener CLOSED", code, reason);
       this.loggedIn = false;
+      this._reconnecting = false; // ★ avoid starvation when code 1000 fires
+      // immediately after relogin's _afterLogin(), before .then() clears the flag.
       this._stopKeepAlive();
       const fatal = code === 3000 || code === 3003;
       if (fatal) {
@@ -864,24 +886,55 @@ export class ZaloClient extends EventEmitter {
   // ── Outbound ──────────────────────────────────────────────────────────
 
   async sendText(threadId, threadType, text, mentions, quote) {
-    // Strip all markdown formatting for plain text Zalo messages
-    const cleanText = String(text)
-      .replace(/\*\*(.+?)\*\*/g, "$1")       // **bold** -> bold
-      .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, "$1") // *italic* -> italic
-      .replace(/__(.+?)__/g, "$1")           // __underline__ -> underline
-      .replace(/~~(.+?)~~/g, "$1")           // ~~strikethrough~~ -> strikethrough
-      .replace(/`{1,3}(.+?)`{1,3}/g, "$1")   // `code` -> code
-      .replace(/^#{1,6}\s+/gm, "")           // # headers -> plain
-      .replace(/^[-*+]\s+/gm, "")            // list items -> plain
-      .replace(/^\d+\.\s+/gm, "")            // numbered lists -> plain
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // [text](url) -> text
-      .replace(/^>\s+/gm, "")                // > blockquotes -> plain
-      .replace(/^---+$/gm, "")               // horizontal rules -> removed
-      .replace(/\n{3,}/g, "\n\n");           // normalize excessive newlines
+    const styles = [];
+    let plain = "";
+    
+    // Pattern to match bold (** or __) and italic (_ only) while tracking string index
+    const pattern = /\*\*(.+?)\*\*|__(.+?)__|_(.+?)_/gs;
+    let lastIndex = 0;
+    const rawText = String(text);
+
+    for (const match of rawText.matchAll(pattern)) {
+      // Add plain text before match
+      plain += rawText.slice(lastIndex, match.index);
+
+      let inner = "";
+      let styleType = "";
+
+      if (match[1] !== undefined) {
+        inner = match[1];
+        styleType = "b";
+      } else if (match[2] !== undefined) {
+        inner = match[2];
+        styleType = "b";
+      } else if (match[3] !== undefined) {
+        inner = match[3];
+        styleType = "i";
+      }
+
+      const start = plain.length;
+      plain += inner;
+      styles.push({ start, len: inner.length, st: styleType });
+
+      lastIndex = match.index + match[0].length;
+    }
+
+    plain += rawText.slice(lastIndex);
+
+    // Apply other formatting cleanups on plain text
+    const cleanText = plain
+      .replace(/`{1,3}(.+?)`{1,3}/gs, "$1")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/^>\s+/gm, "")
+      .replace(/^---+$/gm, "")
+      .replace(/\n{3,}/g, "\n\n");
 
     const content = { msg: cleanText };
+    if (styles.length > 0) content.styles = styles;
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
+    
     return await this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType));
   }
 
@@ -1095,6 +1148,186 @@ export class ZaloClient extends EventEmitter {
     return { groups, friends };
   }
 
+  // ── Group image bulk-download ─────────────────────────────────────────────
+
+  /**
+   * Download all images from a group's chat history to a local directory.
+   *
+   * @param {string} groupId         Zalo group thread ID
+   * @param {object} opts
+   * @param {string} opts.savePath   Directory to save images (created if missing)
+   * @param {number|null} opts.fromTs  Unix timestamp (ms) — only download images
+   *                                   sent on or after this time. null = all.
+   * @param {Function} opts.onProgress Called with (downloaded, skipped, total) after each image.
+   * @param {Function} opts.onStatus   Called with a status string for logging.
+   * @returns {{ downloaded, skipped, errors, savePath }}
+   */
+  async downloadGroupImages(groupId, { savePath, fromTs = null, onProgress, onStatus } = {}) {
+    const fs = await import("node:fs/promises");
+    // Use Node.js 18+ built-in fetch (no external dep needed).
+    const fetchFn = globalThis.fetch;
+    if (!fetchFn) throw new Error("Built-in fetch not available (requires Node.js >=18)");
+
+    const log = (msg) => {
+      console.log(`[zalo:download] ${msg}`);
+      if (onStatus) onStatus(msg);
+    };
+
+    // Ensure output directory exists.
+    await fs.mkdir(savePath, { recursive: true });
+
+    // Get session cookies to authenticate Zalo CDN requests.
+    let cookieHeader = "";
+    try {
+      const jar = this.api.getCookie?.();
+      if (jar) {
+        const cookies = jar.toJSON?.()?.cookies ?? jar.serializeSync?.()?.cookies ?? [];
+        cookieHeader = cookies
+          .map((c) => `${c.key}=${c.value}`)
+          .join("; ");
+      }
+    } catch (e) {
+      log(`Warning: could not extract session cookies: ${e.message}`);
+    }
+
+    const headers = {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+      Referer: "https://chat.zalo.me/",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+    };
+
+    let downloaded = 0;
+    let skipped = 0;
+    let errors = 0;
+    let pageCount = 0;
+    let lastMsgId = undefined; // pagination cursor (undefined = first page)
+    const BATCH = 50;          // messages per getGroupChatHistory call
+    const DELAY_MS = 600;      // delay between image downloads (anti-rate-limit)
+    const seenUrls = new Set();
+
+    log(`Starting image scan for group ${groupId} → ${savePath}`);
+    if (fromTs) {
+      log(`Date filter: only images sent at/after ${new Date(fromTs).toISOString()}`);
+    }
+
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      pageCount++;
+      let msgs;
+      try {
+        // getGroupChatHistory(groupId, lastMsgId, count, lastMsgType)
+        // lastMsgId = undefined for first page; subsequent pages use the oldest msgId.
+        const args = lastMsgId !== undefined
+          ? [String(groupId), String(lastMsgId), BATCH, 0]
+          : [String(groupId), "0", BATCH, 0];
+        msgs = await this.api.getGroupChatHistory(...args);
+      } catch (e) {
+        log(`Error fetching history page ${pageCount}: ${e.message}`);
+        break;
+      }
+
+      const items = (msgs && (msgs.data || msgs)) || [];
+      const arr = Array.isArray(items) ? items : [];
+      log(`Page ${pageCount}: got ${arr.length} messages`);
+
+      if (!arr.length) break;
+
+      // Sort ascending by ts so we process oldest→newest within each batch.
+      arr.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
+
+      let hitDateFilter = false;
+      for (const msg of arr) {
+        const msgTs = Number(msg.ts || msg.timestamp || 0);
+
+        // If we have a fromTs filter and this message is OLDER, skip and continue
+        // (we'll reach it eventually since we page backward, but dates may mix).
+        if (fromTs && msgTs < fromTs) {
+          hitDateFilter = true;
+          continue;
+        }
+
+        const msgType = msg.msgType || (msg.data && msg.data.msgType) || "";
+        if (msgType !== "chat.photo" && msgType !== "chat.gif") continue;
+
+        // Extract image URL (prefer HD).
+        const content = msg.data?.content || msg.content || {};
+        let params = {};
+        try {
+          params = typeof content.params === "string"
+            ? JSON.parse(content.params)
+            : content.params || {};
+        } catch { params = {}; }
+
+        const url = params.hd || params.original || content.href || content.thumb || "";
+        if (!url || seenUrls.has(url)) { skipped++; continue; }
+        seenUrls.add(url);
+
+        const msgId = String(msg.msgId || msg.data?.msgId || Date.now());
+        const ext = msgType === "chat.gif" ? "gif" : "jpg";
+        const fname = `${msgTs}_${msgId}.${ext}`;
+        const dest = `${savePath}/${fname}`;
+
+        // Skip if already downloaded.
+        try {
+          await fs.access(dest);
+          skipped++;
+          continue;
+        } catch { /* not exists, proceed */ }
+
+        // Download with retry.
+        let ok = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            const resp = await fetchFn(url, { headers, signal: AbortSignal.timeout(30000) });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const buf = Buffer.from(await resp.arrayBuffer());
+            // Basic magic-byte check (JPEG or PNG or GIF or WebP).
+            const valid =
+              (buf[0] === 0xff && buf[1] === 0xd8) ||          // JPEG
+              (buf[0] === 0x89 && buf[1] === 0x50) ||          // PNG
+              buf.toString("ascii", 0, 3) === "GIF" ||         // GIF
+              (buf.toString("ascii", 0, 4) === "RIFF" &&       // WebP
+               buf.toString("ascii", 8, 12) === "WEBP");
+            if (!valid) { log(`Skip ${fname}: not a recognised image`); skipped++; ok = true; break; }
+            await fs.writeFile(dest, buf);
+            downloaded++;
+            ok = true;
+            break;
+          } catch (e) {
+            if (attempt === 3) {
+              log(`Error downloading ${fname} (attempt ${attempt}): ${e.message}`);
+              errors++;
+            } else {
+              await new Promise((r) => setTimeout(r, 1000 * attempt));
+            }
+          }
+        }
+        if (ok && onProgress) onProgress(downloaded, skipped, errors);
+        await new Promise((r) => setTimeout(r, DELAY_MS));
+      }
+
+      // Update cursor to the oldest msgId in this batch for next page.
+      const oldest = arr[0];
+      const oldestMsgId = oldest?.msgId || oldest?.data?.msgId;
+      if (!oldestMsgId || String(oldestMsgId) === String(lastMsgId)) break;
+      lastMsgId = oldestMsgId;
+
+      // If we have a date filter and all messages in this batch are newer than
+      // fromTs, keep paging backward (older). If all are older, we're done.
+      if (fromTs && hitDateFilter && arr.every((m) => Number(m.ts || 0) < fromTs)) {
+        log("All messages in batch predate the from-date filter; stopping.");
+        break;
+      }
+
+      // Rate-limit between pages.
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    log(`Done. downloaded=${downloaded} skipped=${skipped} errors=${errors}`);
+    return { downloaded, skipped, errors, savePath };
+  }
+
   // ── Generic passthrough to any zca-js API method ──────────────────────────
   // Covers the long tail of zca-js APIs without a bespoke wrapper each. Args
   // are passed positionally; any arg equal to the string "user"/"group" is
@@ -1133,7 +1366,16 @@ export class ZaloClient extends EventEmitter {
     }
     this.api = null;
     this.loggedIn = false;
-    return await this.login({ forceQR, cookieOnly });
+    // Timeout: if zca-js login hangs (e.g. stale credentials, dead server),
+    // don't let the whole auto-relogin chain stall forever.
+    const TIMEOUT_MS = 30_000;
+    const result = await Promise.race([
+      this.login({ forceQR, cookieOnly }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("login timed out")), TIMEOUT_MS),
+      ),
+    ]);
+    return result;
   }
 
   /** Graceful shutdown: stop timers, listener, close the persistence stream. */
