@@ -192,6 +192,11 @@ export class ZaloClient extends EventEmitter {
         const value = await fetcher();
         this._infoLastCallAt = Date.now();
         this._infoCache.set(key, { value, ts: Date.now() });
+        // Prevent memory leak by bounding cache size
+        if (this._infoCache.size > 10000) {
+          const it = this._infoCache.keys();
+          for (let i = 0; i < 1000; i++) this._infoCache.delete(it.next().value);
+        }
         // success resets backoff
         this._infoBackoffMs = 0;
         this._infoBackoffUntil = 0;
@@ -822,7 +827,8 @@ export class ZaloClient extends EventEmitter {
         media = { kind, url: c.href || "", fileName: "video.mp4", ext: "mp4", mime: "video/mp4", size: params.fileSize || 0 };
         text = c.description || "";
       } else if (kind === "file") {
-        const ext = params.fileExt || (c.title || "").split(".").pop() || "bin";
+        const parts = (c.title || "").split(".");
+        const ext = params.fileExt || (parts.length > 1 ? parts.pop().toLowerCase() : "bin");
         media = { kind, url: c.href || "", fileName: c.title || `file.${ext}`, ext, mime: "application/octet-stream", size: params.fileSize || 0 };
         text = `[file: ${c.title || ""}]`;
       } else if (kind === "contact") {
@@ -888,15 +894,23 @@ export class ZaloClient extends EventEmitter {
   async sendText(threadId, threadType, text, mentions, quote) {
     const styles = [];
     let plain = "";
+
+    // Clean structural markdown tags FIRST to preserve correct character indices
+    const cleanedRaw = String(text)
+      .replace(/`{1,3}(.+?)`{1,3}/gs, "$1")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/^>\s+/gm, "")
+      .replace(/^---+$/gm, "")
+      .replace(/\n{3,}/g, "\n\n");
     
-    // Pattern to match bold (** or __) and italic (_ only) while tracking string index
+    // Pattern to match bold (** or __) and italic (_ only) on cleaned text
     const pattern = /\*\*(.+?)\*\*|__(.+?)__|_(.+?)_/gs;
     let lastIndex = 0;
-    const rawText = String(text);
 
-    for (const match of rawText.matchAll(pattern)) {
+    for (const match of cleanedRaw.matchAll(pattern)) {
       // Add plain text before match
-      plain += rawText.slice(lastIndex, match.index);
+      plain += cleanedRaw.slice(lastIndex, match.index);
 
       let inner = "";
       let styleType = "";
@@ -919,18 +933,9 @@ export class ZaloClient extends EventEmitter {
       lastIndex = match.index + match[0].length;
     }
 
-    plain += rawText.slice(lastIndex);
+    plain += cleanedRaw.slice(lastIndex);
 
-    // Apply other formatting cleanups on plain text
-    const cleanText = plain
-      .replace(/`{1,3}(.+?)`{1,3}/gs, "$1")
-      .replace(/^#{1,6}\s+/gm, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/^>\s+/gm, "")
-      .replace(/^---+$/gm, "")
-      .replace(/\n{3,}/g, "\n\n");
-
-    const content = { msg: cleanText };
+    const content = { msg: plain };
     if (styles.length > 0) content.styles = styles;
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
@@ -1237,11 +1242,11 @@ export class ZaloClient extends EventEmitter {
       arr.sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0));
 
       let hitDateFilter = false;
+      // Collect candidate download items for this page.
+      const downloadTasks = [];
       for (const msg of arr) {
         const msgTs = Number(msg.ts || msg.timestamp || 0);
 
-        // If we have a fromTs filter and this message is OLDER, skip and continue
-        // (we'll reach it eventually since we page backward, but dates may mix).
         if (fromTs && msgTs < fromTs) {
           hitDateFilter = true;
           continue;
@@ -1268,42 +1273,51 @@ export class ZaloClient extends EventEmitter {
         const fname = `${msgTs}_${msgId}.${ext}`;
         const dest = `${savePath}/${fname}`;
 
-        // Skip if already downloaded.
-        try {
-          await fs.access(dest);
-          skipped++;
-          continue;
-        } catch { /* not exists, proceed */ }
+        downloadTasks.push({ url, fname, dest });
+      }
 
-        // Download with retry.
-        let ok = false;
-        for (let attempt = 1; attempt <= 3; attempt++) {
-          try {
-            const resp = await fetchFn(url, { headers, signal: AbortSignal.timeout(30000) });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const buf = Buffer.from(await resp.arrayBuffer());
-            // Basic magic-byte check (JPEG or PNG or GIF or WebP).
-            const valid =
-              (buf[0] === 0xff && buf[1] === 0xd8) ||          // JPEG
-              (buf[0] === 0x89 && buf[1] === 0x50) ||          // PNG
-              buf.toString("ascii", 0, 3) === "GIF" ||         // GIF
-              (buf.toString("ascii", 0, 4) === "RIFF" &&       // WebP
-               buf.toString("ascii", 8, 12) === "WEBP");
-            if (!valid) { log(`Skip ${fname}: not a recognised image`); skipped++; ok = true; break; }
-            await fs.writeFile(dest, buf);
-            downloaded++;
-            ok = true;
-            break;
-          } catch (e) {
-            if (attempt === 3) {
-              log(`Error downloading ${fname} (attempt ${attempt}): ${e.message}`);
-              errors++;
-            } else {
-              await new Promise((r) => setTimeout(r, 1000 * attempt));
+      // Download images in parallel batches (Concurrency = 5) for high speed & safe IO
+      const CONCURRENCY = 5;
+      for (let i = 0; i < downloadTasks.length; i += CONCURRENCY) {
+        const batch = downloadTasks.slice(i, i + CONCURRENCY);
+        await Promise.all(
+          batch.map(async ({ url, fname, dest }) => {
+            // Skip if already downloaded.
+            try {
+              await fs.access(dest);
+              skipped++;
+              return;
+            } catch { /* not exists, proceed */ }
+
+            let ok = false;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                const resp = await fetchFn(url, { headers, signal: AbortSignal.timeout(30000) });
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const buf = Buffer.from(await resp.arrayBuffer());
+                const valid =
+                  (buf[0] === 0xff && buf[1] === 0xd8) ||          // JPEG
+                  (buf[0] === 0x89 && buf[1] === 0x50) ||          // PNG
+                  buf.toString("ascii", 0, 3) === "GIF" ||         // GIF
+                  (buf.toString("ascii", 0, 4) === "RIFF" &&       // WebP
+                   buf.toString("ascii", 8, 12) === "WEBP");
+                if (!valid) { log(`Skip ${fname}: not a recognised image`); skipped++; ok = true; break; }
+                await fs.writeFile(dest, buf);
+                downloaded++;
+                ok = true;
+                break;
+              } catch (e) {
+                if (attempt === 3) {
+                  log(`Error downloading ${fname} (attempt ${attempt}): ${e.message}`);
+                  errors++;
+                } else {
+                  await new Promise((r) => setTimeout(r, 1000 * attempt));
+                }
+              }
             }
-          }
-        }
-        if (ok && onProgress) onProgress(downloaded, skipped, errors);
+            if (ok && onProgress) onProgress(downloaded, skipped, errors);
+          })
+        );
         await new Promise((r) => setTimeout(r, DELAY_MS));
       }
 
