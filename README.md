@@ -210,6 +210,7 @@ rate-limit:
 - `GET  /friends` → list all friends · `GET /find-user?phone=` → look up by phone
 - `GET  /groups` → list all groups (raw `gridVerMap`)
 - `GET  /contacts` → `{ groups:[{id,name}], friends:[{id,name}] }` — friendly id+name list for the setup wizard (batched + cached + rate-limited)
+- `POST /group/download-images` → `{ groupId, fromDate?, savePath? }` (bulk download group images; supports SSE `download_progress` updates)
 - `POST /group/create` `{name, members[]}` · `/group/add` `/group/remove` `/group/rename` `/group/deputy` `{groupId, members[]|name}` · `/group/leave` `{groupId, silent?}`
 - `POST /poll/create` → `{ groupId, question, options[], expiredTime?, allowMultiChoices?, allowAddNewOption?, hideVotePreview?, isAnonymous? }`
 - `POST /api/<method>` → `{ args: [...] }` — **generic passthrough to ANY zca-js API method** (full 145-API parity). Pass args positionally as zca-js documents; use `"user"`/`"group"` where a ThreadType is needed (auto-converted). Examples: `/api/forwardMessage`, `/api/deleteMessage`, `/api/sendVideo`, `/api/getGroupMembersInfo`, `/api/getGroupChatHistory`, `/api/createReminder`, `/api/setMute`, `/api/votePoll`, `/api/blockUser`, `/api/updateProfile`. Unknown method → error.

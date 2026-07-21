@@ -212,6 +212,7 @@ nghi bị rate-limit:
 - `GET  /friends` → liệt kê tất cả bạn bè · `GET /find-user?phone=` → tra theo số điện thoại
 - `GET  /groups` → liệt kê tất cả nhóm (raw `gridVerMap`)
 - `GET  /contacts` → `{ groups:[{id,name}], friends:[{id,name}] }` — danh sách id+tên thân thiện cho wizard (batched + cache + giới hạn tốc độ)
+- `POST /group/download-images` → `{ groupId, fromDate?, savePath? }` (tải hàng loạt ảnh trong nhóm; phát sự kiện tiến độ qua SSE `download_progress`)
 - `POST /group/create` `{name, members[]}` · `/group/add` `/group/remove` `/group/rename` `/group/deputy` `{groupId, members[]|name}` · `/group/leave` `{groupId, silent?}`
 - `POST /poll/create` → `{ groupId, question, options[], expiredTime?, allowMultiChoices?, allowAddNewOption?, hideVotePreview?, isAnonymous? }`
 - `POST /api/<method>` → `{ args: [...] }` — **passthrough chung tới BẤT KỲ method nào của zca-js** (đủ 145 API). Truyền args theo thứ tự như zca-js mô tả; dùng `"user"`/`"group"` ở vị trí cần ThreadType (tự chuyển đổi). Ví dụ: `/api/forwardMessage`, `/api/deleteMessage`, `/api/sendVideo`, `/api/getGroupMembersInfo`, `/api/getGroupChatHistory`, `/api/createReminder`, `/api/setMute`, `/api/votePoll`, `/api/blockUser`, `/api/updateProfile`. Method không tồn tại → lỗi.
