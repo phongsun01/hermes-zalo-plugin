@@ -11,6 +11,7 @@
 //   ZALO_FORCE_QR         (1/true to ignore saved credentials and re-QR)
 
 import express from "express";
+import compression from "compression";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -166,17 +167,20 @@ function pushEvent(type, payload) {
     }
     msgDedupSet.add(payload.messageId);
     msgDedupRing.push(payload.messageId);
-    if (msgDedupRing.length > DEDUP_SIZE) {
-      const old = msgDedupRing.shift();
-      msgDedupSet.delete(old);
+    if (msgDedupRing.length > DEDUP_SIZE * 1.5) {
+      const removed = msgDedupRing.splice(0, msgDedupRing.length - DEDUP_SIZE);
+      for (const id of removed) msgDedupSet.delete(id);
     }
   }
 
   const id = nextEventId++;
-  const record = { id, type, payload };
-  ring.push(record);
-  if (ring.length > RING_SIZE) ring.shift();
   const frame = `id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  ring.push({ id, frame });
+
+  if (ring.length > RING_SIZE * 1.5) {
+    ring.splice(0, ring.length - RING_SIZE);
+  }
+
   for (const res of sseClients) {
     try {
       res.write(frame);
@@ -196,6 +200,7 @@ client.on("group_event", (g) => pushEvent("group_event", g));
 
 // ── Express ─────────────────────────────────────────────────────────────
 const app = express();
+app.use(compression());
 app.use(express.json({ limit: "2mb" }));
 
 // Action-policy middleware for the first-class routes (ROUTE_ACTION map above).
@@ -329,9 +334,7 @@ app.get("/events", (req, res) => {
   if (lastId > 0) {
     for (const rec of ring) {
       if (rec.id > lastId) {
-        res.write(
-          `id: ${rec.id}\nevent: ${rec.type}\ndata: ${JSON.stringify(rec.payload)}\n\n`,
-        );
+        res.write(rec.frame);
       }
     }
   }
