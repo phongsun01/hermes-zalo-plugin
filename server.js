@@ -9,6 +9,7 @@
 //   ZALO_QR_PATH          (default ./data/qr.png)
 //   ZALO_SELF_LISTEN      (1/true to receive own messages; default off)
 //   ZALO_FORCE_QR         (1/true to ignore saved credentials and re-QR)
+//   ZALO_LOG_MESSAGES     (1/true to log raw message payloads to console; default off)
 
 import express from "express";
 import compression from "compression";

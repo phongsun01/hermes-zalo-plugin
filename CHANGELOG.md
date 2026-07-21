@@ -18,15 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added HTTP request logging middleware (`morgan("dev")`).
   - Added global Express error handling middleware to catch unhandled async errors cleanly.
   - Added 30-second timeout guard (`Promise.race`) for generic passthrough `/api/:method` calls to prevent hanging sockets.
-  - Added Gzip response compression (`compression` middleware).
+  - Added `ZALO_LOG_MESSAGES` environment variable flag (default off) to prevent sensitive raw chat payloads from leaking into console logs.
+- **Process Boot ID Tracking (`X-Bridge-Boot-Id`)**: Introduced process-unique `BOOT_ID` to `/health` and SSE `/events` response header `X-Bridge-Boot-Id` so SSE consumers can differentiate process restarts from transient network drops.
 
 ### Fixed
 - **Markdown Style Index Shift (`sendText`)**: Strip structural markdown tags (`code`, `header`, `link`, `blockquote`) *before* matching bold/italic styles to preserve exact character index offsets on Zalo.
+- **Italic Regex Word Boundary Guard**: Added non-whitespace boundary guards to italic regex matching (`(?<=\s|^)_(?!\s)...(?<!\s)_(?=\s|$)`) to prevent false-positive italic matches on filenames, variables, and phone numbers.
 - **File Extension Extraction (`_normaliseMessage`)**: Fixed bug where files without dots incorrectly returned the entire title as the file extension instead of falling back to `"bin"`.
 - **Memory Leak in Info Cache (`_infoCache`)**: Added size bounding (max 10,000 items) to automatically trim old cache entries.
 - **Ring Buffer Optimization**: Replaced continuous `.shift()` on arrays with chunked `.splice()` when exceeding threshold ($1.5 \times \text{SIZE}$).
 - **SSE Frame Pre-Serialization**: Pre-serialized SSE frames in `pushEvent()` to eliminate repetitive `JSON.stringify()` calls on SSE event replay.
-- **SSE Replay Mismatch (`adapter.py`)**: Automatically reset `_last_event_id = None` on SSE disconnect to prevent Last-Event-ID replay conflicts when the Node.js bridge restarts.
+- **SSE Replay Over-Correction (`adapter.py`)**: Adapter no longer blindly drops `Last-Event-ID` on every disconnect. Bridge now sends `X-Bridge-Boot-Id`; adapter only resets its event cursor when this boot ID changes (i.e., when the bridge process actually restarted), preserving replay functionality across transient network drops.
 - **Media Download I/O Blocking (`adapter.py`)**: Added bounded `total=30s` and `sock_read=25s` timeout to `_download_media()`.
 - **CLI Terminal Layout Breaking (`adapter.py`)**: Truncated long group/contact names (>50 chars) in the interactive setup wizard picker.
 

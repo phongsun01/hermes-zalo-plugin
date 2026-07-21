@@ -141,6 +141,7 @@ Bạn cũng có thể lấy QR trong lúc server đang chạy:
 | `ZALO_QR_PATH` | `~/.hermes-zalo/qr.png` | Nơi ghi ảnh QR |
 | `ZALO_SELF_LISTEN` | tắt | Nhận cả tin nhắn do chính mình gửi đi |
 | `ZALO_FORCE_QR` | tắt | Bỏ qua credentials đã lưu, đăng nhập lại bằng QR |
+| `ZALO_LOG_MESSAGES` | `tắt` | Log nội dung tin nhắn thô ra console để debug. CẢNH BÁO: Có thể chứa dữ liệu cá nhân nhạy cảm — chỉ bật tạm thời khi debug. |
 | `ZALO_CLIMSG_RETENTION_DAYS` | `30` | Số ngày giữ cache thu hồi (msgId→cliMsgId) trên đĩa tại `~/.hermes-zalo/climsgids/` (JSONL xoay theo ngày, tự dọn). Nạp lại khi khởi động để chức năng thu hồi (undo) sống sót qua restart. `0` = tắt lưu đĩa (chỉ trong RAM). |
 | `ZALO_ALLOWED_ACTION_GROUPS` | `read,send,interact` | Danh sách nhóm quyền (phân theo mức độ nguy hiểm): `read` < `send` < `interact` < `manage` < `destructive` (hoặc `all`). Chặn CẢ `/api/<method>` lẫn các route first-class. |
 | `ZALO_ALLOW_DESTRUCTIVE` | `false` | Phải `true` mới cho phép nhóm `destructive` (disperseGroup, deleteMessage, deleteChat, removeFriend, blockUser, leaveGroup, changeGroupOwner, updateProfile/Settings…). TẮT ngay cả khi groups=`all`. |
@@ -199,9 +200,9 @@ nghi bị rate-limit:
 
 ## 4. HTTP API
 
-- `GET  /health` → `{ ok, loggedIn, sessionDead, sessionDeadReason, ownId, qr, sseClients }`
+- `GET  /health` → `{ ok, bootId, loggedIn, sessionDead, sessionDeadReason, ownId, qr, sseClients }`
 - `GET  /qr` / `GET /qr.png` → trạng thái QR / ảnh PNG
-- `GET  /events` → luồng SSE (`event: message` / `status` / `session_dead` / `reaction` / `undo` / `friend_event` / `group_event`)
+- `GET  /events` → luồng SSE (`event: message` / `status` / `session_dead` / `reaction` / `undo` / `friend_event` / `group_event`). Response header bao gồm `X-Bridge-Boot-Id` (thay đổi mỗi khi tiến trình bridge khởi động lại). Phía nhận SSE nên lưu giá trị này; nếu `bootId` đổi giữa các lần reconnect thì reset lại cursor `Last-Event-ID` (do ring buffer đã bị xoá), còn nếu `bootId` giữ nguyên thì truyền lại bình thường để replay tin nhắn bị bỏ lỡ.
 - `POST /relogin` → `{ forceQR? }` khôi phục phiên chết/hết hạn (chạy lại đăng nhập QR; rồi poll `/qr.png` để quét)
 - `POST /shutdown` → dừng êm (đóng listener, SSE, file stream, thoát). SIGTERM/SIGINT cũng vậy.
 - `POST /send` → `{ threadId, threadType: "user"|"group", text, mentions?, quote? }` (mentions = `[{pos,uid,len}]` để @nhắc; quote = một SendMessageQuote từ tin đến để trả lời)

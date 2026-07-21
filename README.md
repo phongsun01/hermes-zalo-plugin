@@ -140,6 +140,7 @@ You can also fetch the QR while the server runs:
 | `ZALO_QR_PATH` | `~/.hermes-zalo/qr.png` | Where the QR PNG is written |
 | `ZALO_SELF_LISTEN` | off | Receive your own outgoing messages too |
 | `ZALO_FORCE_QR` | off | Ignore saved credentials and re-QR |
+| `ZALO_LOG_MESSAGES` | `false` | Log raw message payload text to console for debugging. WARNING: May contain sensitive chat data — enable temporarily for debug only. |
 | `ZALO_CLIMSG_RETENTION_DAYS` | `30` | Days to keep the undo cache (msgId→cliMsgId) on disk under `~/.hermes-zalo/climsgids/` (daily-rotated JSONL, auto-pruned). Reloaded on startup so message recall (undo) survives restarts. `0` disables persistence (memory-only). |
 | `ZALO_ALLOWED_ACTION_GROUPS` | `read,send,interact` | Comma-separated permission groups, by danger level: `read` < `send` < `interact` < `manage` < `destructive` (or `all`). Gates BOTH `/api/<method>` and the first-class routes. |
 | `ZALO_ALLOW_DESTRUCTIVE` | `false` | Must be `true` to permit the `destructive` group (disperseGroup, deleteMessage, deleteChat, removeFriend, blockUser, leaveGroup, changeGroupOwner, updateProfile/Settings…). OFF even when groups=`all`. |
@@ -197,9 +198,9 @@ rate-limit:
 
 ## 4. HTTP API
 
-- `GET  /health` → `{ ok, loggedIn, sessionDead, sessionDeadReason, ownId, qr, sseClients }`
+- `GET  /health` → `{ ok, bootId, loggedIn, sessionDead, sessionDeadReason, ownId, qr, sseClients }`
 - `GET  /qr` / `GET /qr.png` → QR state / PNG
-- `GET  /events` → SSE stream (`event: message` / `status` / `session_dead` / `reaction` / `undo` / `friend_event` / `group_event`)
+- `GET  /events` → SSE stream (`event: message` / `status` / `session_dead` / `reaction` / `undo` / `friend_event` / `group_event`). Response headers include `X-Bridge-Boot-Id` (changes on process restart). SSE consumers should inspect this header; if `bootId` changes across reconnects, reset `Last-Event-ID` cursor (ring buffer was reset), otherwise preserve it to replay missed events safely.
 - `POST /relogin` → `{ forceQR? }` recover a dead/expired session (re-run QR login; then poll `/qr.png` to scan)
 - `POST /shutdown` → graceful stop (closes listener, SSE, file streams, exits). SIGTERM/SIGINT do the same.
 - `POST /send` → `{ threadId, threadType: "user"|"group", text, mentions?, quote? }` (mentions = `[{pos,uid,len}]` for @mention; quote = a SendMessageQuote from an inbound message for replies)
