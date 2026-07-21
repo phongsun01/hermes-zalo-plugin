@@ -1221,11 +1221,8 @@ export class ZaloClient extends EventEmitter {
       pageCount++;
       let msgs;
       try {
-        // Primary: zca-js getGroupChatHistory
-        const args = lastMsgId !== undefined
-          ? [String(groupId), String(lastMsgId), BATCH, 0]
-          : [String(groupId), "0", BATCH, 0];
-        msgs = await this.api.getGroupChatHistory(...args);
+        // Primary: zca-js getGroupChatHistory(groupId, count)
+        msgs = await this.api.getGroupChatHistory(String(groupId), BATCH);
       } catch (e) {
         log(`api.getGroupChatHistory failed on page ${pageCount} (${e.message}), trying loadmsg fallback...`);
         try {
