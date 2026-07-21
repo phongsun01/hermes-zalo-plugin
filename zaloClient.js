@@ -694,11 +694,13 @@ export class ZaloClient extends EventEmitter {
         if (d.msgId && d.cliMsgId) {
           this._recordCliMsgId(d.msgId, d.cliMsgId);
         }
-        console.log(
-          `[zalo] RAW message: type=${isGroup ? "group" : "user"} thread=${message.threadId} ` +
-            `from=${d.uidFrom} self=${message.isSelf} msgType=${d.msgType} ` +
-            `content=${typeof d.content === "string" ? JSON.stringify(d.content).slice(0, 80) : JSON.stringify(d.content).slice(0, 400)}`,
-        );
+        if (process.env.ZALO_LOG_MESSAGES === "1" || process.env.ZALO_LOG_MESSAGES === "true") {
+          console.log(
+            `[zalo] RAW message: type=${isGroup ? "group" : "user"} thread=${message.threadId} ` +
+              `from=${d.uidFrom} self=${message.isSelf} msgType=${d.msgType} ` +
+              `content=${typeof d.content === "string" ? JSON.stringify(d.content).slice(0, 80) : JSON.stringify(d.content).slice(0, 400)}`,
+          );
+        }
         const ev = this._normaliseMessage(message);
         if (ev) this.emit("message", ev);
       } catch (e) {
@@ -904,8 +906,8 @@ export class ZaloClient extends EventEmitter {
       .replace(/^---+$/gm, "")
       .replace(/\n{3,}/g, "\n\n");
     
-    // Pattern to match bold (** or __) and italic (_ only) on cleaned text
-    const pattern = /\*\*(.+?)\*\*|__(.+?)__|_(.+?)_/gs;
+    // Pattern to match bold (** or __) and italic (_ only with non-space boundaries) on cleaned text
+    const pattern = /\*\*(.+?)\*\*|__(.+?)__|(?<=\s|^)_(?!\s)(.+?)(?<!\s)_(?=\s|$)/gs;
     let lastIndex = 0;
 
     for (const match of cleanedRaw.matchAll(pattern)) {

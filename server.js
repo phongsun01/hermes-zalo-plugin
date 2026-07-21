@@ -24,6 +24,11 @@ import { credentialsPath, qrPath, cliMsgDir } from "./paths.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Unique per-process id, regenerated every time the bridge (re)starts.
+// Lets SSE consumers tell "bridge restarted" apart from a transient network
+// drop, so they know whether it's safe to resume via Last-Event-ID or not.
+const BOOT_ID = crypto.randomUUID();
+
 const PORT = parseInt(process.env.ZALO_PLUGIN_PORT || "8787", 10);
 const HOST = process.env.ZALO_PLUGIN_HOST || "127.0.0.1";
 const TOKEN = process.env.ZALO_PLUGIN_TOKEN || "";
@@ -270,6 +275,7 @@ app.get("/policy", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
+    bootId: BOOT_ID,
     loggedIn: client.loggedIn,
     sessionDead: !!client.sessionDead,
     sessionDeadReason: client.sessionDeadReason || null,
@@ -343,6 +349,7 @@ app.get("/events", (req, res) => {
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
     "X-Accel-Buffering": "no",
+    "X-Bridge-Boot-Id": BOOT_ID,
   });
   res.write(`retry: 3000\n\n`);
 

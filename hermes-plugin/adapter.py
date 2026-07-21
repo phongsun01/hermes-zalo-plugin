@@ -290,6 +290,7 @@ class ZaloAdapter(BasePlatformAdapter):
         self._sse_task: Optional[asyncio.Task] = None
         self._stop = False
         self._last_event_id = 0
+        self._bridge_boot_id: Optional[str] = None
 
         # Message dedup ring: skip duplicate messageIds from SSE reconnect or bridge listener overlap.
         self._dedup_max = 200
@@ -435,6 +436,20 @@ class ZaloAdapter(BasePlatformAdapter):
                 ) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"SSE status {resp.status}")
+
+                    # Detect an actual bridge restart (ring buffer wiped) vs. a
+                    # transient network blip on the *same* bridge process.
+                    # Only in the former case is it correct to drop Last-Event-ID.
+                    boot_id = resp.headers.get("X-Bridge-Boot-Id")
+                    if boot_id and self._bridge_boot_id and boot_id != self._bridge_boot_id:
+                        logger.info(
+                            "Zalo: bridge restarted (boot id changed); "
+                            "resetting event cursor (missed events cannot be replayed)"
+                        )
+                        self._last_event_id = None
+                    if boot_id:
+                        self._bridge_boot_id = boot_id
+
                     backoff = 1.0  # reset after a successful connect
                     await self._consume_sse(resp)
             except asyncio.CancelledError:
@@ -442,11 +457,9 @@ class ZaloAdapter(BasePlatformAdapter):
             except Exception as e:
                 if self._stop:
                     break
-                logger.warning("Zalo: SSE disconnected (%s); resetting event ID & reconnecting in %.1fs", e, backoff)
-                # Reset last_event_id on drop to avoid SSE replay mismatch if bridge restarted
-                self._last_event_id = None
-                # During backoff, poll /health every 2s so we reconnect ASAP
-                # when the bridge comes back, instead of waiting for full backoff.
+                logger.warning("Zalo: SSE disconnected (%s); reconnecting in %.1fs", e, backoff)
+                # Keep _last_event_id so transient disconnects on the same bridge
+                # process can replay missed events via SSE Last-Event-ID.
                 await self._wait_with_health_poll(backoff)
                 backoff = min(backoff * 2, 10.0)
 
