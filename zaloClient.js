@@ -23,6 +23,111 @@ const AUTO_RELOGIN_BASE_MS = 5_000;
 const AUTO_RELOGIN_MAX_MS = 60_000;
 const MAX_AUTO_RELOGIN_ATTEMPTS = 5;
 
+// TQuote.cliMsgType (numeric) → msgType string, inverse of zca-js's
+// getClientMessageType(). Used when reclassifying quoted-message content
+// (data.quote.attach), which only has cliMsgType, not msgType.
+const CLIMSGTYPE_TO_MSGTYPE = {
+  1: "webchat",
+  31: "chat.voice",
+  32: "chat.photo",
+  36: "chat.sticker",
+  37: "chat.doodle",
+  38: "chat.recommended",
+  43: "chat.location.new",
+  44: "chat.video.msg",
+  46: "share.file",
+  49: "chat.gif",
+};
+
+/**
+ * Classify a content object by msgType into {text, attachment, media}.
+ * Shared between main message content (data.content) and quoted-message
+ * content (JSON.parse(data.quote.attach)).
+ */
+function classifyContent(msgType, c) {
+  let text = "";
+  let attachment = null;
+  let media = null;
+
+  if (typeof c === "string") {
+    return { text: c, attachment: null, media: null };
+  }
+  if (!c || typeof c !== "object") {
+    return { text: "", attachment: null, media: null };
+  }
+
+  let params = {};
+  try {
+    params = typeof c.params === "string" ? JSON.parse(c.params) : c.params || {};
+  } catch {
+    params = {};
+  }
+
+  attachment = {
+    title: c.title || "",
+    description: c.description || "",
+    href: c.href || "",
+    thumb: c.thumb || "",
+    type: c.type || msgType || "",
+    params,
+  };
+
+  const kindMap = {
+    "chat.photo": "image",
+    "chat.gif": "image",
+    "chat.voice": "voice",
+    "chat.video.msg": "video",
+    "share.file": "file",
+    "chat.sticker": "sticker",
+    "chat.recommended": "contact",
+    "chat.location.new": "location",
+  };
+  const kind = kindMap[msgType] || "other";
+
+  if (kind === "voice") {
+    const url = params.m4a || c.href || "";
+    media = { kind, url, fileName: "voice.aac", ext: "aac", mime: "audio/aac", size: params.fileSize || 0 };
+    text = "[voice message]";
+  } else if (kind === "image") {
+    media = {
+      kind,
+      url: params.hd || c.href || "",
+      fileName: "image.jpg",
+      ext: "jpg",
+      mime: "image/jpeg",
+      size: params.fileSize || 0,
+      width: params.width || 0,
+      height: params.height || 0,
+    };
+    text = c.description || "";
+  } else if (kind === "video") {
+    media = { kind, url: c.href || "", fileName: "video.mp4", ext: "mp4", mime: "video/mp4", size: params.fileSize || 0 };
+    text = c.description || "";
+  } else if (kind === "file") {
+    const parts = (c.title || "").split(".");
+    const ext = params.fileExt || (parts.length > 1 ? parts.pop().toLowerCase() : "bin");
+    media = { kind, url: c.href || "", fileName: c.title || `file.${ext}`, ext, mime: "application/octet-stream", size: params.fileSize || 0 };
+    text = `[file: ${c.title || ""}]`;
+  } else if (kind === "contact") {
+    let info = {};
+    try {
+      info = typeof c.description === "string" ? JSON.parse(c.description) : c.description || {};
+    } catch {
+      info = {};
+    }
+    attachment.contact = { name: c.title || "", phone: info.phone || "", gUid: info.gUid || "" };
+    text = `[contact: ${c.title || ""}${info.phone ? " " + info.phone : ""}]`;
+  } else if (kind === "sticker") {
+    text = "[sticker]";
+  } else if (kind === "location") {
+    text = "[location]";
+  } else {
+    text = c.title || c.description || "";
+  }
+
+  return { text, attachment, media };
+}
+
 /**
  * Read image dimensions from a local file by parsing the header bytes.
  * Supports PNG, JPEG, GIF, WebP, BMP — no external deps. Returns null if
@@ -941,77 +1046,37 @@ export class ZaloClient extends EventEmitter {
     if (typeof data.content === "string") {
       text = data.content;
     } else if (data.content && typeof data.content === "object") {
-      const c = data.content;
-      let params = {};
-      try {
-        params = typeof c.params === "string" ? JSON.parse(c.params) : c.params || {};
-      } catch {
-        params = {};
-      }
+      const r = classifyContent(msgType, data.content);
+      text = r.text;
+      attachment = r.attachment;
+      media = r.media;
+    }
 
-      attachment = {
-        title: c.title || "",
-        description: c.description || "",
-        href: c.href || "",
-        thumb: c.thumb || "",
-        type: c.type || msgType || "",
-        params,
-      };
-
-      // Classify and extract a downloadable URL by msgType.
-      const kindMap = {
-        "chat.photo": "image",
-        "chat.gif": "image",
-        "chat.voice": "voice",
-        "chat.video.msg": "video",
-        "share.file": "file",
-        "chat.sticker": "sticker",
-        "chat.recommended": "contact",
-        "chat.location.new": "location",
-      };
-      const kind = kindMap[msgType] || "other";
-
-      if (kind === "voice") {
-        const url = params.m4a || c.href || "";
-        media = { kind, url, fileName: "voice.aac", ext: "aac", mime: "audio/aac", size: params.fileSize || 0 };
-        text = "[voice message]";
-      } else if (kind === "image") {
-        media = {
-          kind,
-          url: params.hd || c.href || "",
-          fileName: "image.jpg",
-          ext: "jpg",
-          mime: "image/jpeg",
-          size: params.fileSize || 0,
-          width: params.width || 0,
-          height: params.height || 0,
-        };
-        text = c.description || "";
-      } else if (kind === "video") {
-        media = { kind, url: c.href || "", fileName: "video.mp4", ext: "mp4", mime: "video/mp4", size: params.fileSize || 0 };
-        text = c.description || "";
-      } else if (kind === "file") {
-        const parts = (c.title || "").split(".");
-        const ext = params.fileExt || (parts.length > 1 ? parts.pop().toLowerCase() : "bin");
-        media = { kind, url: c.href || "", fileName: c.title || `file.${ext}`, ext, mime: "application/octet-stream", size: params.fileSize || 0 };
-        text = `[file: ${c.title || ""}]`;
-      } else if (kind === "contact") {
-        // Vietnamese: danh thiếp. description holds {phone, qrCodeUrl, gUid}.
-        let info = {};
+    // ── Quote content (text + media of the message being replied to) ────────
+    let quotedText = "";
+    let quotedFrom = "";
+    let quotedOwnerId = "";
+    let quotedMedia = null;
+    let quotedAttachment = null;
+    if (data.quote) {
+      quotedText = typeof data.quote.msg === "string" ? data.quote.msg : "";
+      quotedFrom = data.quote.fromD ? String(data.quote.fromD) : "";
+      quotedOwnerId = data.quote.ownerId ? String(data.quote.ownerId) : "";
+      // data.quote.attach is a JSON string describing the quoted message's
+      // content object — reuse classifyContent to extract media for download.
+      if (data.quote.attach) {
         try {
-          info = typeof c.description === "string" ? JSON.parse(c.description) : c.description || {};
-        } catch {
-          info = {};
+          const qc = typeof data.quote.attach === "string" ? JSON.parse(data.quote.attach) : data.quote.attach;
+          const quotedMsgType = CLIMSGTYPE_TO_MSGTYPE[data.quote.cliMsgType] || "";
+          const r = classifyContent(quotedMsgType, qc);
+          quotedMedia = r.media;
+          quotedAttachment = r.attachment;
+        } catch (e) {
+          console.error("[zalo] failed to parse quote.attach:", e.message);
         }
-        attachment.contact = { name: c.title || "", phone: info.phone || "", gUid: info.gUid || "" };
-        text = `[contact: ${c.title || ""}${info.phone ? " " + info.phone : ""}]`;
-      } else if (kind === "sticker") {
-        text = "[sticker]";
-      } else if (kind === "location") {
-        text = `[location]`;
-      } else {
-        text = c.title || c.description || "";
       }
+    } else {
+      quotedOwnerId = "";
     }
 
     return {
@@ -1027,15 +1092,14 @@ export class ZaloClient extends EventEmitter {
       msgType,
       ts: String(data.ts || Date.now()),
       isSelf: !!message.isSelf,
-      // Real @mentions (group only): list of mentioned uids so the adapter can
-      // detect being addressed without guessing from text.
       mentions: Array.isArray(data.mentions)
         ? data.mentions.map((mn) => String(mn && mn.uid ? mn.uid : "")).filter(Boolean)
         : [],
-      // uid of the owner of the quoted message (set when this is a reply). If it
-      // equals our ownId, the user is replying to the bot.
-      quotedOwnerId: data.quote && data.quote.ownerId ? String(data.quote.ownerId) : "",
-      // Enough to build a SendMessageQuote for replies.
+      quotedOwnerId,
+      quotedText,
+      quotedFrom,
+      quotedMedia,
+      quotedAttachment,
       quote: {
         content: typeof data.content === "string" ? data.content : data.content,
         msgType: data.msgType,

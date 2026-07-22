@@ -207,8 +207,9 @@ def _truthy(v) -> bool:
 def _parse_home_channel(raw: str) -> tuple[str, str]:
     """Parse ZALO_HOME_CHANNEL into (chat_id, thread_type).
 
-    Accepts ``<threadId>`` (defaults to user) or ``<type>:<threadId>``
-    where type is ``user`` or ``group``.
+    Requires ``<type>:<threadId>`` where type is ``user`` or ``group``.
+    Bare IDs (without prefix) are rejected with a warning to avoid sending
+    messages to wrong threads when cron or home-channel delivery runs.
     """
     raw = str(raw or "").strip()
     if not raw:
@@ -218,7 +219,12 @@ def _parse_home_channel(raw: str) -> tuple[str, str]:
         prefix = prefix.strip().lower()
         if prefix in {"user", "group"}:
             return rest.strip(), prefix
-    return raw, "user"
+    logger.warning(
+        "ZALO_HOME_CHANNEL=%r missing 'group:' or 'user:' prefix — treating as unconfigured. "
+        "Use 'group:%s' if this is a group ID, or 'user:%s' if it's a user ID.",
+        raw, raw, raw,
+    )
+    return "", "user"
 
 
 class ZaloAdapter(BasePlatformAdapter):
@@ -693,6 +699,26 @@ class ZaloAdapter(BasePlatformAdapter):
                 media_types.append(media.get("mime") or "")
                 message_type = mtype
 
+        # Download quoted-message media so the agent can see what the user is
+        # replying to (e.g. a document in the chat that the agent needs to review).
+        quoted_media = m.get("quotedMedia")
+        if isinstance(quoted_media, dict) and quoted_media.get("url"):
+            q_local_path, q_mtype = await self._download_media(quoted_media)
+            if q_local_path:
+                media_urls.append(q_local_path)
+                media_types.append(quoted_media.get("mime") or "")
+                if message_type == MessageType.TEXT:
+                    message_type = q_mtype
+
+        # Prepend quoted context so the agent knows which message is being replied to.
+        quoted_text = m.get("quotedText") or ""
+        quoted_from = m.get("quotedFrom") or ""
+        if (quoted_text or quoted_media) and str(m.get("quotedOwnerId") or "") != str(self._own_id):
+            label = f'"{quoted_text[:200]}"' if quoted_text else "[không có text]"
+            media_note = f" (kèm {quoted_media['kind']})" if isinstance(quoted_media, dict) else ""
+            prefix = f'[Trả lời {quoted_from or "tin nhắn trước"}: {label}{media_note}]\n'
+            text = prefix + text
+
         event = MessageEvent(
             text=text,
             message_type=message_type,
@@ -902,13 +928,26 @@ class ZaloAdapter(BasePlatformAdapter):
         except Exception as e:
             return {"error": str(e)}
 
-    def _thread_type_from_chat_id(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+    async def _thread_type_from_chat_id(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
         if metadata and metadata.get("thread_type") in {"user", "group"}:
             return metadata["thread_type"]
-        # Use the type remembered from inbound messages for this chat.
-        remembered = self._thread_types.get(str(chat_id))
-        if remembered in {"user", "group"}:
-            return remembered
+        cached = self._thread_types.get(str(chat_id))
+        if cached in {"user", "group"}:
+            return cached
+        # Cold cache (restart / cron before any inbound message) — ask the
+        # bridge, which has persistent SQLite that survives restarts.
+        try:
+            r = await self._get(f"/thread-type/{chat_id}")
+            tt = r.get("threadType")
+            if tt in {"user", "group"}:
+                self._thread_types[str(chat_id)] = tt
+                return tt
+        except Exception:
+            pass
+        logger.warning(
+            "Zalo: cannot determine thread_type for %s — defaulting to 'user'. "
+            "May send to wrong thread if this is a group ID.", chat_id,
+        )
         return "user"
 
     async def send(
@@ -918,7 +957,7 @@ class ZaloAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
         # Split long messages.
         chunks = self.truncate_message(content, max_length=self.max_message_length)
         last = None
@@ -946,14 +985,14 @@ class ZaloAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=msg_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
         await self._post("/typing", {"threadId": chat_id, "threadType": thread_type})
 
     async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
         return await self.send_image_file(chat_id, image_url, caption, reply_to, metadata)
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
         res = await self._post(
             "/send-attachment",
             {"threadId": chat_id, "threadType": thread_type, "path": image_path, "caption": caption or ""},
@@ -963,7 +1002,7 @@ class ZaloAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
         res = await self._post(
             "/send-attachment",
             {"threadId": chat_id, "threadType": thread_type, "path": file_path, "caption": caption or ""},
@@ -976,7 +1015,7 @@ class ZaloAdapter(BasePlatformAdapter):
         return await self.send_document(chat_id, video_path, caption=caption, metadata=metadata)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
         body = {"threadId": chat_id, "threadType": thread_type}
         if str(audio_path).startswith(("http://", "https://")):
             body["voiceUrl"] = audio_path
@@ -1001,7 +1040,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def react(self, chat_id, msg_id, icon="HEART", cli_msg_id=None, thread_type=None):
         """React to a message. icon = HEART/LIKE/HAHA/WOW/CRY/ANGRY/… or raw."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        tt = thread_type if thread_type else await self._thread_type_from_chat_id(str(chat_id), None)
         return await self._post("/react", {
             "threadId": chat_id, "threadType": tt,
             "msgId": str(msg_id), "cliMsgId": str(cli_msg_id or msg_id), "icon": icon,
@@ -1009,7 +1048,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def undo(self, chat_id, msg_id, cli_msg_id=None, thread_type=None):
         """Recall/undo one of our own messages."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        tt = thread_type if thread_type else await self._thread_type_from_chat_id(str(chat_id), None)
         return await self._post("/undo", {
             "threadId": chat_id, "threadType": tt,
             "msgId": str(msg_id), "cliMsgId": str(cli_msg_id or msg_id),
@@ -1017,7 +1056,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def reply(self, chat_id, text, quote, thread_type=None):
         """Send a text reply quoting a prior message (quote = SendMessageQuote)."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        tt = thread_type if thread_type else await self._thread_type_from_chat_id(str(chat_id), None)
         return await self._post("/send", {
             "threadId": chat_id, "threadType": tt, "text": text, "quote": quote,
         })
@@ -1029,7 +1068,7 @@ class ZaloAdapter(BasePlatformAdapter):
         })
 
     async def send_card(self, chat_id, user_id, phone_number=None, thread_type=None):
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        tt = thread_type if thread_type else await self._thread_type_from_chat_id(str(chat_id), None)
         body = {"threadId": chat_id, "threadType": tt, "userId": str(user_id)}
         if phone_number:
             body["phoneNumber"] = str(phone_number)

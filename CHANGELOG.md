@@ -7,43 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **SQLite Message Store (replaces JSON checkpoint)**:
-  - New `lib/sqlite-store.js` — pure DAO with `sql.js` (WASM, no native deps): 5 tables (`messages`, `attachments`, `threads`, `friends`, `sync_state`), WAL-like journal, `PRAGMA user_version`-based migrations, `chmod 600` on db file, transaction helper.
-  - New `lib/message-repository.js` — orchestrator: `saveIncoming()` (insert + checkpoint + thread upsert in one transaction), `saveHistory()` (batch), `getContext()`, `search()`, checkpoint CRUD, `migrateFromJson()` (legacy → SQLite), sync state tracking.
-- **Live message persistence**: `zaloClient.js` now fire-and-forgets `repository.saveIncoming(ev)` on every live message (non-blocking, SSE emits first).
-- **Self-loop aware direction**: Messages are stored with `direction: 'incoming'` or `'outgoing'` based on the `isSelf` flag.
-- **SQLite health status**: `/health` endpoint now exposes `sqlite.messages|threads|attachments|syncPending|syncTotal` instead of the old JSON checkpoint fields.
-- **`lib/` index & smoke tests**: `lib/index.js` re-exports; `scratch/test_sqlite_store.js` (13 tests) + updated `scratch/test_checkpoint.js` (15 tests, all green).
-
 ### Changed
-- **zaloClient.js checkpoint engine**: Replaced `_checkpoint` (in-memory JSON), `_loadCheckpoint`, `_saveCheckpoint`, `_checkpointChanged`, `_checkpointTimer` with SQLite-backed `_store`/`_repository`/`_dbChanged`/`_dbTimer`. Migration path: `migrateFromJson()` reads legacy `thread_checkpoint.json` and upserts into SQLite `threads` table.
-- **Graceful shutdown**: `_setupGracefulFlush` and `shutdown()` now persist db + close store instead of writing JSON.
-- **Catchup**: `_catchupMissedMessages()` reads checkpoints from `repository.getCheckpointsForCatchup()` instead of in-memory dict.
-- **Dependency**: Added `sql.js` (pure JS SQLite, no native compilation) instead of `better-sqlite3`.
+- **`zaloClient.js` — Shared content classification + quote media extraction**: Inline ~70-line content classification refactored into shared `classifyContent(msgType, c)` function reused for both `data.content` and `data.quote.attach`. Added `CLIMSGTYPE_TO_MSGTYPE` map for numeric→string msgType conversion. `_normaliseMessage` now returns `quotedText`, `quotedFrom`, `quotedMedia`, `quotedAttachment` from the quoted message.
+- **`server.js` — `/thread-type/:threadId` route**: New GET endpoint queries SQLite persistent checkpoint via `repository.getCheckpoint()`, enabling Python adapter to resolve thread type after restarts or cron cold starts.
+- **`adapter.py` — `_thread_type_from_chat_id` async with bridge fallback**: Changed from sync to async; on cache miss, calls bridge `/thread-type/:threadId` for persistent SQLite lookup instead of silently defaulting to `"user"`. Added warning log when type cannot be determined.
+- **`adapter.py` — `_parse_home_channel` rejects bare IDs**: Bare thread IDs without `group:`/`user:` prefix now return empty (no-op delivery) with a warning, preventing silent misrouting to wrong thread.
+- **`adapter.py` — 9 callers updated**: All 5 send methods (`send`, `send_typing`, `send_image_file`, `send_document`, `send_voice`) + 4 extended actions (`react`, `undo`, `reply`, `send_card`) now use `await self._thread_type_from_chat_id()`.
+
+### Added
+- **Quote reply context for AI**: Bridge now forwards `quotedText` (text content of the replied-to message), `quotedFrom` (sender name), `quotedMedia` (media object via `classifyContent` on `data.quote.attach`), and `quotedAttachment` to the adapter. Adapter downloads quoted media so the agent can see replied-to images/files, and prepends a `[Trả lời <name>: "text" (kèm media)]\n` prefix to the message text.
 
 ### Fixed
-- **Atomic persist**: `persist()` now writes to `.tmp` then `renameSync` để tránh corruption nếu crash giữa lúc ghi file.
-- **message_uid compound key**: Đổi từ `message_id UNIQUE` sang `message_uid = threadId:msgId` để tránh duplicate key crash khi 2 thread khác nhau có cùng msgId (hoặc msgId rỗng).
-- **getContext sai thứ tự**: Sửa `ORDER BY ts ASC LIMIT N` → subquery `DESC LIMIT N` rồi outer `ASC` — trả về N tin mới nhất (không phải cũ nhất).
-- **Duplicate checkpoint upsert**: Live handler không còn gọi `_updateThreadLastSeen` — `saveIncoming` tự upsert checkpoint + trigger persist qua `onDirty`.
-- **onDirty callback**: Repository tự gọi `onDirty()` sau mọi write operation, không cần zaloClient quản lý cờ `_dbChanged` thủ công.
-
-### Added (Phase 2 — Sync)
-- **HistorySync (`lib/history-sync.js`)**: Resumable sync engine. `start()` syncs friends + resumes pending/error entities; `resume()` continues from `sync_state`; `stop()` sets flag. Non-blocking, runs after login.
-- **InMemoryCache (`lib/in-memory-cache.js`)**: LRU msgId→cliMsgId (500 entries), Set groupId, Map friend (2000 entries). Best-effort, persistence in SQLite only.
-- **Repository sync methods**: `syncGroupHistory()` — fetch group chat history via API, batch insert with `source='sync'`, update `sync_state` with cursor; `syncDMHistory()` — DM via `loadmsg` API; `syncFriends()` — upsert full friend directory; `syncResume()` — continue pending/error entities.
-- **DM catchup via loadmsg**: `_fetchThreadHistory()` now calls `api.callRaw('loadmsg', ...)` for DM threads (previously skipped silently).
-- **Schema v3**: Added `cli_msg_id`, `quote_msg_id`, `quote_cli_msg_id`, `quote_owner_id`, `status`, `source` columns to `messages`; `mime_type`, `file_path`, `raw_json` to `attachments`; `title`, `peer_id`, `avatar_url`, `is_hidden`, `raw_json` to `threads`; `zalo_name`, `raw_json` to `friends`. Recreated `sync_state` with composite PK `(entity_type, entity_id)` + `cursor` and `synced_count` columns.
-- **Quote persistence**: `saveIncoming()` now stores `quote_msg_id`, `quote_cli_msg_id`, `quote_owner_id` from the normalized event.
-- **Source tracking**: Each message row records `source` (`live`, `catchup`, `sync`) to distinguish origin.
-- **/health enhancements**: Exposes `sqlite.dbVersion`, `cache.*`, `historySync.*` (running, startedAt, lastError), `sqlite.syncDone`.
-
-### Changed
-- **saveHistory()** accepts optional `source` parameter (default `'sync'`).
-- **upsertSyncState()** now uses composite PK + cursor/synced_count.
-- **sync_state** queries use composite PK ordering.
-- **Dependency**: No new packages (sql.js already added in Phase 1).
+- **Cron gửi sai thread (root cause)**: `_thread_type_from_chat_id` no longer silently defaults to `"user"` on cache miss after restart. Bridge lookup via `/thread-type/:threadId` resolves thread type from SQLite, which persists across bridge restarts and accumulates data from all inbound messages.
+- **ZALO_HOME_CHANNEL bare ID footgun**: IDs without `group:`/`user:` prefix are now rejected with a clear warning, preventing cron delivery to wrong threads.
+- **`quotedOwnerId` undeclared variable**: Fixed ReferenceError in strict ESM mode — `let quotedOwnerId` was being assigned without declaration in `_normaliseMessage`.
 
 ## [Unreleased] (previous)
 

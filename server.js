@@ -810,6 +810,15 @@ app.post("/poll/create", asyncHandler(async (req, res) => {
   res.json({ success: true, result: await client.createPoll(groupId, question, options, extra) });
 }));
 
+// Lookup thread_type from persistent SQLite (survives bridge restart).
+// Falls back to null if the thread is unknown or repository not ready.
+app.get("/thread-type/:threadId", asyncHandler(async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  if (!client._repository) return res.json({ threadId: req.params.threadId, threadType: null });
+  const row = client._repository.getCheckpoint(req.params.threadId);
+  res.json({ threadId: req.params.threadId, threadType: row ? row.thread_type : null });
+}));
+
 // Global Error Handler Middleware (Chốt chặn xử lý lỗi cuối cùng)
 app.use((err, req, res, next) => {
   console.error(`[bridge] Express Error:`, err);
