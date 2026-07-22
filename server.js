@@ -281,6 +281,8 @@ app.get("/policy", (req, res) => {
 app.get("/health", (req, res) => {
   const dbStats = client._repository ? client._repository.getStats() : null;
   const syncStats = client._repository ? client._repository.getSyncStats() : null;
+  const cacheStats = client._cache ? client._cache.getStats() : null;
+  const hs = client._historySync || null;
   res.json({
     ok: true,
     bootId: BOOT_ID,
@@ -288,7 +290,7 @@ app.get("/health", (req, res) => {
     sessionDead: !!client.sessionDead,
     sessionDeadReason: client.sessionDeadReason || null,
     ownId: client.ownId,
-    state: client.state, // PR2 state mapping
+    state: client.state,
     qr: client.qrState ? client.qrState.status : null,
     sseClients: sseClients.size,
     sqlite: {
@@ -297,9 +299,17 @@ app.get("/health", (req, res) => {
       messages: dbStats?.messages || 0,
       threads: dbStats?.threads || 0,
       attachments: dbStats?.attachments || 0,
+      syncDone: syncStats?.done || 0,
       syncPending: syncStats?.pending || 0,
       syncTotal: syncStats?.total || 0,
+      dbVersion: 3,
     },
+    cache: cacheStats || {},
+    historySync: hs ? {
+      running: hs.isRunning,
+      startedAt: hs.startedAt,
+      lastError: hs.lastError,
+    } : null,
     catchup: {
       running: client._catchingUp,
       lastCatchupAt: client._stats.lastCatchupAt,

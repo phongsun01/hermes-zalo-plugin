@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
-import { createStore, createRepository } from "./lib/index.js";
+import { createStore, createRepository, createCache, HistorySync } from "./lib/index.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -548,6 +548,7 @@ export class ZaloClient extends EventEmitter {
     if (!this._store) {
       this._store = await createStore(this._dbPath);
       this._repository = createRepository(this._store, {
+        api: this.api,
         onDirty: () => {
           this._dbChanged = true;
           this._schedulePersistDb();
@@ -556,6 +557,17 @@ export class ZaloClient extends EventEmitter {
       // Migrate legacy JSON → SQLite
       this._repository.migrateFromJson(this.checkpointPath);
       console.log("[zalo] SQLite store ready at", this._dbPath);
+    }
+    // Init in-memory cache
+    if (!this._cache) {
+      this._cache = createCache();
+    }
+    // Init HistorySync on first login (background, async)
+    if (!this._historySync) {
+      this._historySync = new HistorySync(this._repository);
+      this._historySync.start().catch((e) => {
+        console.warn("[zalo] initial HistorySync failed:", e.message);
+      });
     }
     this._wireListeners();
     // retryOnClose: zca-js auto-reconnects the Zalo websocket on drop.
@@ -1595,9 +1607,6 @@ export class ZaloClient extends EventEmitter {
   }
 
   async _fetchThreadHistory(threadId, threadType, lastMsgId, fromTs) {
-    // DM catch-up không được hỗ trợ bởi zca-js — upstream limitation, skip silently
-    if (threadType !== "group") return [];
-
     const BATCH = this.maxMessagesPerThread || 50;
     let msgs = null;
     let attempts = 3;
@@ -1605,7 +1614,12 @@ export class ZaloClient extends EventEmitter {
 
     for (let i = 0; i < attempts; i++) {
       try {
-        msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
+        if (threadType === "group") {
+          msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
+        } else {
+          // DM: use loadmsg API (verified working for DM in v8)
+          msgs = await this.api.callRaw("loadmsg", [String(threadId), BATCH]);
+        }
         break;
       } catch (err) {
         if (i === attempts - 1) throw err;
@@ -1616,7 +1630,6 @@ export class ZaloClient extends EventEmitter {
     }
 
     const arr = Array.isArray(msgs) ? msgs : (Array.isArray(msgs?.data) ? msgs.data : []);
-    // Filter messages that predate fromTs
     return arr.filter((m) => {
       const ts = Number(m.ts || m.timestamp || 0);
       return ts > fromTs;

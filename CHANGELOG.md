@@ -29,6 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Duplicate checkpoint upsert**: Live handler không còn gọi `_updateThreadLastSeen` — `saveIncoming` tự upsert checkpoint + trigger persist qua `onDirty`.
 - **onDirty callback**: Repository tự gọi `onDirty()` sau mọi write operation, không cần zaloClient quản lý cờ `_dbChanged` thủ công.
 
+### Added (Phase 2 — Sync)
+- **HistorySync (`lib/history-sync.js`)**: Resumable sync engine. `start()` syncs friends + resumes pending/error entities; `resume()` continues from `sync_state`; `stop()` sets flag. Non-blocking, runs after login.
+- **InMemoryCache (`lib/in-memory-cache.js`)**: LRU msgId→cliMsgId (500 entries), Set groupId, Map friend (2000 entries). Best-effort, persistence in SQLite only.
+- **Repository sync methods**: `syncGroupHistory()` — fetch group chat history via API, batch insert with `source='sync'`, update `sync_state` with cursor; `syncDMHistory()` — DM via `loadmsg` API; `syncFriends()` — upsert full friend directory; `syncResume()` — continue pending/error entities.
+- **DM catchup via loadmsg**: `_fetchThreadHistory()` now calls `api.callRaw('loadmsg', ...)` for DM threads (previously skipped silently).
+- **Schema v3**: Added `cli_msg_id`, `quote_msg_id`, `quote_cli_msg_id`, `quote_owner_id`, `status`, `source` columns to `messages`; `mime_type`, `file_path`, `raw_json` to `attachments`; `title`, `peer_id`, `avatar_url`, `is_hidden`, `raw_json` to `threads`; `zalo_name`, `raw_json` to `friends`. Recreated `sync_state` with composite PK `(entity_type, entity_id)` + `cursor` and `synced_count` columns.
+- **Quote persistence**: `saveIncoming()` now stores `quote_msg_id`, `quote_cli_msg_id`, `quote_owner_id` from the normalized event.
+- **Source tracking**: Each message row records `source` (`live`, `catchup`, `sync`) to distinguish origin.
+- **/health enhancements**: Exposes `sqlite.dbVersion`, `cache.*`, `historySync.*` (running, startedAt, lastError), `sqlite.syncDone`.
+
+### Changed
+- **saveHistory()** accepts optional `source` parameter (default `'sync'`).
+- **upsertSyncState()** now uses composite PK + cursor/synced_count.
+- **sync_state** queries use composite PK ordering.
+- **Dependency**: No new packages (sql.js already added in Phase 1).
+
 ## [Unreleased] (previous)
 
 ### Added
