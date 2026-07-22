@@ -23,7 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dependency**: Added `sql.js` (pure JS SQLite, no native compilation) instead of `better-sqlite3`.
 
 ### Fixed
-- **Foreign key schema**: `messages.message_id` is now `UNIQUE` so `attachments` FK constraint works correctly with `ON DELETE CASCADE`.
+- **Atomic persist**: `persist()` now writes to `.tmp` then `renameSync` để tránh corruption nếu crash giữa lúc ghi file.
+- **message_uid compound key**: Đổi từ `message_id UNIQUE` sang `message_uid = threadId:msgId` để tránh duplicate key crash khi 2 thread khác nhau có cùng msgId (hoặc msgId rỗng).
+- **getContext sai thứ tự**: Sửa `ORDER BY ts ASC LIMIT N` → subquery `DESC LIMIT N` rồi outer `ASC` — trả về N tin mới nhất (không phải cũ nhất).
+- **Duplicate checkpoint upsert**: Live handler không còn gọi `_updateThreadLastSeen` — `saveIncoming` tự upsert checkpoint + trigger persist qua `onDirty`.
+- **onDirty callback**: Repository tự gọi `onDirty()` sau mọi write operation, không cần zaloClient quản lý cờ `_dbChanged` thủ công.
 
 ## [Unreleased] (previous)
 

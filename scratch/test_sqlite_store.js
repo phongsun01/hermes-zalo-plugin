@@ -85,7 +85,14 @@ async function run() {
   const ctx = repo.getContext("g_1");
   if (ctx.length !== 2) throw new Error(`Expected 2 context messages`);
   if (Number(ctx[0].ts) !== 1000 || Number(ctx[1].ts) !== 2000) throw new Error(`Context order wrong`);
-  console.log("  ✓ getContext: ordered by ts ASC");
+  // Verify message_uid compound key
+  if (ctx[0].message_uid !== "g_1:msg_1") throw new Error(`Expected message_uid g_1:msg_1, got ${ctx[0].message_uid}`);
+  if (ctx[1].message_uid !== "g_1:msg_2") throw new Error(`Expected message_uid g_1:msg_2, got ${ctx[1].message_uid}`);
+  // getContext with limit=1 should return only the latest (most recent) message
+  const ctx1 = repo.getContext("g_1", 1);
+  if (ctx1.length !== 1) throw new Error(`Expected 1 context message with limit=1`);
+  if (Number(ctx1[0].ts) !== 2000) throw new Error(`Expected latest message (ts=2000) with limit=1, got ts=${ctx1[0].ts}`);
+  console.log("  ✓ getContext: ordered by ts ASC, returns latest N");
 
   // 9. search
   const results = repo.search("Hello");

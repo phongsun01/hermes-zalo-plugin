@@ -547,7 +547,12 @@ export class ZaloClient extends EventEmitter {
     // Init SQLite store + repository (ownId known now)
     if (!this._store) {
       this._store = await createStore(this._dbPath);
-      this._repository = createRepository(this._store);
+      this._repository = createRepository(this._store, {
+        onDirty: () => {
+          this._dbChanged = true;
+          this._schedulePersistDb();
+        },
+      });
       // Migrate legacy JSON → SQLite
       this._repository.migrateFromJson(this.checkpointPath);
       console.log("[zalo] SQLite store ready at", this._dbPath);
@@ -839,9 +844,8 @@ export class ZaloClient extends EventEmitter {
         }
         const ev = this._normaliseMessage(message);
         if (ev) {
-          // PR1: Update checkpoint for live inbound messages
-          this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
-          // Save to SQLite asynchronously (fire-and-forget, non-blocking SSE)
+          // Save to SQLite asynchronously (non-blocking SSE; saveIncoming
+          // internally handles thread checkpoint upsert + persist trigger)
           if (this._repository) {
             void this._repository.saveIncoming(ev).catch((e) => {
               console.error("[zalo] failed to save incoming message:", e.message);
