@@ -6,6 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
+import { createStore, createRepository } from "./lib/index.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -96,7 +97,7 @@ export class ZaloClient extends EventEmitter {
    * @param {string} opts.qrPath           Where to write the QR PNG during login.
    * @param {boolean} opts.selfListen      Whether to receive our own messages.
    */
-  constructor({ credentialsPath, qrPath, selfListen = false, cliMsgDir = null, cliMsgRetentionDays = 30, infoCacheTtlMs = 600000, infoMinIntervalMs = 1500 }) {
+  constructor({ credentialsPath, qrPath, selfListen = false, dbPath = null, cliMsgDir = null, cliMsgRetentionDays = 30, infoCacheTtlMs = 600000, infoMinIntervalMs = 1500 }) {
     super();
     this.credentialsPath = credentialsPath;
     this.qrPath = qrPath;
@@ -144,6 +145,44 @@ export class ZaloClient extends EventEmitter {
     this._infoQueue = Promise.resolve(); // serializes info calls
     this._infoBackoffUntil = 0; // epoch ms; while > now, refuse fresh calls
     this._infoBackoffMs = 0; // current backoff window (grows on repeated limits)
+
+    // ── SQLite store & repository (replaces JSON checkpoint) ───────────────
+    this._dbPath = dbPath || path.join(path.dirname(this.credentialsPath), "zalo.sqlite");
+    this.checkpointPath = path.join(path.dirname(this.credentialsPath), "thread_checkpoint.json");
+    this._store = null;
+    this._repository = null;
+    this._dbChanged = false;
+    this._dbTimer = null;
+
+    // Config clamping
+    const clamp = (val, min, max, def) => {
+      const n = parseInt(val, 10);
+      return Number.isInteger(n) ? Math.max(min, Math.min(n, max)) : def;
+    };
+    this.maxTrackedThreads = clamp(process.env.ZALO_MAX_TRACKED_THREADS, 10, 500, 100);
+    this.maxMessagesPerThread = clamp(process.env.ZALO_MAX_MESSAGES_PER_THREAD, 1, 200, 50);
+    this.maxCatchupWindowMs = clamp(process.env.ZALO_CATCHUP_MAX_WINDOW_MS, 300000, 86400000, 7200000); // 5m to 24h, default 2h
+
+    // State machine & Lifecycle
+    this.state = "DISCONNECTED"; // DISCONNECTED, CONNECTING, CONNECTED, CATCHUP, READY
+    this._hasConnectedOnce = false;
+    this._catchingUp = false;
+    this._keepAliveConsecutiveFailures = 0;
+
+    // Statistics
+    this._stats = {
+      disconnectCount: 0,
+      lastDisconnectDurationMs: 0,
+      keepAliveFailures: 0,
+      lastCatchupAt: 0,
+      recoveredCount: 0,      // cumulative (all-time)
+      lastRecoveredCount: 0,  // per-catchup count
+      historyFetchErrors: 0,
+    };
+    this._lastDisconnectAt = 0;
+
+    // Setup graceful flush handlers for process signals
+    this._setupGracefulFlush();
   }
 
   // ── Rate-limited, cached read-info gateway ────────────────────────────────
@@ -505,6 +544,14 @@ export class ZaloClient extends EventEmitter {
       this.ownId = null;
     }
     console.log("[zalo] logged in. ownId =", this.ownId);
+    // Init SQLite store + repository (ownId known now)
+    if (!this._store) {
+      this._store = await createStore(this._dbPath);
+      this._repository = createRepository(this._store);
+      // Migrate legacy JSON → SQLite
+      this._repository.migrateFromJson(this.checkpointPath);
+      console.log("[zalo] SQLite store ready at", this._dbPath);
+    }
     this._wireListeners();
     // retryOnClose: zca-js auto-reconnects the Zalo websocket on drop.
     // Inject code 1000 + 1006 into zca-js retry system so WS reconnects
@@ -527,8 +574,52 @@ export class ZaloClient extends EventEmitter {
         };
       }
     }
+    this.setState("CONNECTED"); // PR2: connection state machine trigger (initial login flow)
     this.api.listener.start({ retryOnClose: true });
     this._startKeepAlive();
+  }
+
+  // ── PR1: Checkpoint Persistence Helpers ──────────────────────────────────
+  _updateThreadLastSeen(threadId, messageId, timestamp, threadType = "user") {
+    if (!threadId || !this._repository) return;
+    try {
+      this._repository.upsertCheckpoint(threadId, threadType, messageId, timestamp);
+      this._dbChanged = true;
+      this._schedulePersistDb();
+    } catch (e) {
+      console.error("[zalo] failed to update checkpoint:", e.message);
+    }
+  }
+
+  _schedulePersistDb() {
+    if (this._dbTimer) return;
+    this._dbTimer = setTimeout(() => {
+      this._dbTimer = null;
+      this._persistDb();
+    }, 10000);
+    if (this._dbTimer.unref) this._dbTimer.unref();
+  }
+
+  _persistDb() {
+    if (!this._dbChanged || !this._store) return;
+    try {
+      this._store.persist();
+      this._dbChanged = false;
+    } catch (e) {
+      console.error("[zalo] failed to persist db:", e.message);
+    }
+  }
+
+  _setupGracefulFlush() {
+    const flush = () => {
+      this._persistDb();
+      if (this._store) {
+        console.log("[zalo] closing SQLite store...");
+        this._store.close();
+      }
+    };
+    process.once("SIGTERM", flush);
+    process.once("SIGINT", flush);
   }
 
   /**
@@ -545,6 +636,7 @@ export class ZaloClient extends EventEmitter {
       Promise.resolve()
         .then(() => api.keepAlive())
         .then(() => {
+          this._keepAliveConsecutiveFailures = 0; // reset failures
           // Refresh cookies after keepAlive — the server may have issued new ones.
           const jar = api.getCookie?.();
           if (jar) {
@@ -558,9 +650,15 @@ export class ZaloClient extends EventEmitter {
             }
           }
         })
-        .catch((e) =>
-          console.warn("[zalo] keepAlive failed:", e && e.message ? e.message : e),
-        );
+        .catch((e) => {
+          this._keepAliveConsecutiveFailures++;
+          this._stats.keepAliveFailures++;
+          console.warn(`[zalo] keepAlive failed (${this._keepAliveConsecutiveFailures}x):`, e && e.message ? e.message : e);
+          if (this._keepAliveConsecutiveFailures >= 3 && !this._reconnecting && !this.sessionDead) {
+            console.warn("[zalo] keepAlive failed 3 consecutive times; triggering relogin...");
+            this._scheduleAutoRelogin(0, "keepalive 3x failure");
+          }
+        });
     }, KEEPALIVE_INTERVAL_MS);
     if (this._keepAliveTimer.unref) this._keepAliveTimer.unref();
   }
@@ -570,6 +668,19 @@ export class ZaloClient extends EventEmitter {
       clearInterval(this._keepAliveTimer);
       this._keepAliveTimer = null;
     }
+  }
+
+  // ── PR2: State Machine ───────────────────────────────────────────────────
+  setState(newState) {
+    // If session is dead, state MUST be SESSION_DEAD regardless of transitions
+    if (this.sessionDead) {
+      newState = "SESSION_DEAD";
+    }
+    if (this.state === newState) return;
+    const oldState = this.state;
+    this.state = newState;
+    console.log(`[zalo] State transition: ${oldState} -> ${newState}`);
+    this.emit("state_change", { oldState, newState });
   }
 
   /** Cancel any pending auto-relogin and clear the in-flight guard. */
@@ -589,6 +700,7 @@ export class ZaloClient extends EventEmitter {
     this.loggedIn = false;
     this.sessionDead = true;
     this.sessionDeadReason = `code=${code} reason=${reason || ""}`.trim();
+    this.setState("SESSION_DEAD"); // PR2: set session dead state
     this.emit("status", { connected: false, dead: true, code, reason });
     this.emit("session_dead", {
       code,
@@ -614,13 +726,14 @@ export class ZaloClient extends EventEmitter {
       this._declareSessionDead(code, reason);
       return;
     }
+    this.setState("CONNECTING"); // PR2: State Machine connecting trigger
     this._reconnecting = true;
     this._autoReloginAttempts++;
     const attempt = this._autoReloginAttempts;
     const delay = Math.min(attempt * AUTO_RELOGIN_BASE_MS, AUTO_RELOGIN_MAX_MS);
     console.log(
       `[zalo] auto-relogin attempt ${attempt}/${MAX_AUTO_RELOGIN_ATTEMPTS} ` +
-        `in ${Math.round(delay / 1000)}s (code=${code})`,
+         `in ${Math.round(delay / 1000)}s (code=${code})`,
     );
     this.emit("status", { connected: false, reconnecting: true, code, reason });
     this._autoReloginTimer = setTimeout(() => {
@@ -652,17 +765,39 @@ export class ZaloClient extends EventEmitter {
 
     listener.on("connected", () => {
       console.log("[zalo] listener connected");
+      const isFirstConnect = !this._hasConnectedOnce;
+      this._hasConnectedOnce = true;
       this.sessionDead = false;
       this.loggedIn = true; // Restore after transient drops
+      
+      // Update statistics
+      if (this._lastDisconnectAt > 0) {
+        this._stats.lastDisconnectDurationMs = Date.now() - this._lastDisconnectAt;
+        this._lastDisconnectAt = 0;
+      }
+      
       // A healthy connection replenishes the auto-relogin budget so periodic
       // drops don't slowly exhaust it over the session's lifetime.
       this._autoReloginAttempts = 0;
       this._reconnecting = false;
       this.emit("status", { connected: true });
+
+      // PR2 & PR3: Trigger catchup or transition directly to READY
+      this.setState("CONNECTED"); // Ensure state transition CONNECTING/DISCONNECTED -> CONNECTED first
+      if (isFirstConnect) {
+        this.setState("READY"); // First connect doesn't catch up
+      } else {
+        this._catchupMissedMessages().catch((e) => {
+          console.error("[zalo] catch-up failed:", e.message);
+        });
+      }
     });
     listener.on("disconnected", (code, reason) => {
       // Transient drop; zca-js will auto-retry (retryOnClose). Just surface it.
       console.log("[zalo] listener disconnected", code, reason);
+      this.setState("DISCONNECTED"); // PR2: State Machine transition
+      this._stats.disconnectCount++;
+      this._lastDisconnectAt = Date.now();
       this.emit("status", { connected: false, transient: true, code, reason });
     });
     listener.on("closed", (code, reason) => {
@@ -671,6 +806,7 @@ export class ZaloClient extends EventEmitter {
       // are terminal — re-scanning QR is the only recovery, so don't auto-retry.
       // Anything else (cookie/network) gets an automatic cookie relogin first.
       console.log("[zalo] listener CLOSED", code, reason);
+      this.setState("DISCONNECTED"); // PR2: State Machine transition
       this.loggedIn = false;
       this._reconnecting = false; // ★ avoid starvation when code 1000 fires
       // immediately after relogin's _afterLogin(), before .then() clears the flag.
@@ -702,7 +838,17 @@ export class ZaloClient extends EventEmitter {
           );
         }
         const ev = this._normaliseMessage(message);
-        if (ev) this.emit("message", ev);
+        if (ev) {
+          // PR1: Update checkpoint for live inbound messages
+          this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
+          // Save to SQLite asynchronously (fire-and-forget, non-blocking SSE)
+          if (this._repository) {
+            void this._repository.saveIncoming(ev).catch((e) => {
+              console.error("[zalo] failed to save incoming message:", e.message);
+            });
+          }
+          this.emit("message", ev);
+        }
       } catch (e) {
         console.error("[zalo] failed to normalise message:", e.message);
       }
@@ -1362,6 +1508,145 @@ export class ZaloClient extends EventEmitter {
     return { downloaded, skipped, errors, savePath };
   }
 
+  // ── PR3: Catch-up & Replay Engine ────────────────────────────────────────
+  async _catchupMissedMessages() {
+    if (this._catchingUp || !this._store || !this._repository) return;
+    this._catchingUp = true;
+    this.setState("CATCHUP");
+    console.log("[zalo] starting catchup scan on tracked threads...");
+    
+    this._stats.lastCatchupAt = Date.now();
+    let recoveredCount = 0;
+    
+    // 1. Gather candidate threads from SQLite checkpoint, prioritized by most recently updated
+    const threadRows = this._repository.getCheckpointsForCatchup(this.maxTrackedThreads);
+    const threads = threadRows.map((row) => ({
+      threadId: row.thread_id,
+      threadType: row.thread_type,
+      checkpoint: { messageId: row.last_message_id, timestamp: row.last_ts },
+      updatedAt: row.updated_at,
+    }));
+
+    // 2. Scan each thread sequentially using a dedicated throttle queue
+    for (const thread of threads) {
+      if (this.state !== "CATCHUP") {
+        console.log("[zalo] catchup aborted due to connection state change");
+        break;
+      }
+      try {
+        const lastSeen = thread.checkpoint;
+        if (!lastSeen || !lastSeen.timestamp) continue;
+
+        // Apply ZALO_CATCHUP_MAX_WINDOW_MS
+        const windowStart = Date.now() - this.maxCatchupWindowMs;
+        const fromTs = Math.max(Number(lastSeen.timestamp), windowStart);
+        
+        console.log(`[zalo] scanning thread ${thread.threadId} (${thread.threadType}) from timestamp ${fromTs} (lastSeen=${lastSeen.timestamp})`);
+        
+        // lastId=0: getGroupChatHistory/loadmsg dùng lastId nghĩa là "cũ hơn ID này",
+        // không phải "mới hơn". Ta luôn lấy N tin gần nhất rồi filter bằng fromTs.
+        const rawMsgs = await this._fetchThreadHistory(thread.threadId, thread.threadType, 0, fromTs);
+        if (!rawMsgs || !rawMsgs.length) continue;
+
+        // 3. Process, normalize, dedup, sort, and emit missed messages
+        const normalized = [];
+        const lastMsgId = lastSeen.messageId || "";
+        const lastTs = Number(lastSeen.timestamp || 0);
+        for (const rawMsg of rawMsgs) {
+          const norm = this._normaliseHistoryMessage(rawMsg, thread.threadId, thread.threadType);
+          if (!norm) continue;
+          // Dedup: chỉ emit nếu message thực sự mới hơn checkpoint
+          // (so sánh timestamp trước, messageId sau để tránh replay tin đã xử lý)
+          const normTs = Number(norm.timestamp || 0);
+          if (normTs < lastTs) continue;
+          if (normTs === lastTs && norm.messageId === lastMsgId) continue;
+          normalized.push(norm);
+        }
+
+        // Sort ascending oldest -> newest
+        normalized.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+        // Emit sequential events
+        for (const ev of normalized) {
+          console.log(`[zalo] replay recovered message: ${ev.messageId} (thread=${ev.threadId})`);
+          this.emit("message", ev);
+          this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
+          recoveredCount++;
+          // Small delay to prevent ring buffer exhaustion at receiver
+          await new Promise((r) => setTimeout(r, 50));
+        }
+      } catch (err) {
+        this._stats.historyFetchErrors++;
+        console.error(`[zalo] failed to catchup thread ${thread.threadId}:`, err.message);
+      }
+      // sequential throttle between threads
+      await new Promise((r) => setTimeout(r, 1200));
+    }
+
+    this._stats.recoveredCount += recoveredCount;
+    this._stats.lastRecoveredCount = recoveredCount;
+    console.log(`[zalo] catchup complete. recovered ${recoveredCount} messages (cumulative: ${this._stats.recoveredCount}).`);
+    this._catchingUp = false;
+    this.setState("READY");
+  }
+
+  async _fetchThreadHistory(threadId, threadType, lastMsgId, fromTs) {
+    // DM catch-up không được hỗ trợ bởi zca-js — upstream limitation, skip silently
+    if (threadType !== "group") return [];
+
+    const BATCH = this.maxMessagesPerThread || 50;
+    let msgs = null;
+    let attempts = 3;
+    let delay = 1000;
+
+    for (let i = 0; i < attempts; i++) {
+      try {
+        msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
+        break;
+      } catch (err) {
+        if (i === attempts - 1) throw err;
+        const jitter = 0.8 + Math.random() * 0.4;
+        await new Promise((r) => setTimeout(r, delay * jitter));
+        delay *= 2;
+      }
+    }
+
+    const arr = Array.isArray(msgs) ? msgs : (Array.isArray(msgs?.data) ? msgs.data : []);
+    // Filter messages that predate fromTs
+    return arr.filter((m) => {
+      const ts = Number(m.ts || m.timestamp || 0);
+      return ts > fromTs;
+    });
+  }
+
+  _normaliseHistoryMessage(rawMsg, threadId, threadType) {
+    const isGroup = threadType === "group";
+    // Critical self-loop protection filtering
+    const senderId = String(rawMsg.uidFrom || rawMsg.senderId || "");
+    if (senderId === String(this.ownId)) {
+      return null;
+    }
+
+    // Map properties to standardized live message shape expected by _normaliseMessage
+    const msgData = {
+      msgId: String(rawMsg.msgId || rawMsg.globalMsgId || ""),
+      cliMsgId: String(rawMsg.cliMsgId || ""),
+      uidFrom: senderId,
+      msgType: rawMsg.msgType || "",
+      content: rawMsg.content,
+      ts: Number(rawMsg.ts || rawMsg.timestamp || 0),
+    };
+
+    const dummyMessage = {
+      type: isGroup ? ThreadType.Group : ThreadType.User,
+      threadId: String(threadId),
+      isSelf: false,
+      data: msgData
+    };
+
+    return this._normaliseMessage(dummyMessage);
+  }
+
   // ── Generic passthrough to any zca-js API method ──────────────────────────
   // Covers the long tail of zca-js APIs without a bespoke wrapper each. Args
   // are passed positionally; any arg equal to the string "user"/"group" is
@@ -1412,7 +1697,7 @@ export class ZaloClient extends EventEmitter {
     return result;
   }
 
-  /** Graceful shutdown: stop timers, listener, close the persistence stream. */
+  /** Graceful shutdown: stop timers, listener, flush SQLite, close the persistence stream. */
   async shutdown() {
     this._stopReconnect();
     this._stopKeepAlive();
@@ -1428,6 +1713,14 @@ export class ZaloClient extends EventEmitter {
       }
     } catch {
       /* ignore */
+    }
+    this._persistDb();
+    if (this._store) {
+      try {
+        this._store.close();
+      } catch {
+        /* ignore */
+      }
     }
     this.loggedIn = false;
     console.log("[zalo] client shut down");

@@ -206,7 +206,12 @@ function pushEvent(type, payload) {
   }
 }
 
-client.on("message", (msg) => pushEvent("message", msg));
+// PR3: Relay inbound messages to SSE.
+// Throttling (50ms between catchup emits) is handled inside
+// _catchupMissedMessages in zaloClient.js — no async needed here.
+client.on("message", (msg) => {
+  pushEvent("message", msg);
+});
 client.on("status", (s) => pushEvent("status", s));
 client.on("session_dead", (d) => pushEvent("session_dead", d));
 client.on("reaction", (r) => pushEvent("reaction", r));
@@ -274,6 +279,8 @@ app.get("/policy", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
+  const dbStats = client._repository ? client._repository.getStats() : null;
+  const syncStats = client._repository ? client._repository.getSyncStats() : null;
   res.json({
     ok: true,
     bootId: BOOT_ID,
@@ -281,8 +288,30 @@ app.get("/health", (req, res) => {
     sessionDead: !!client.sessionDead,
     sessionDeadReason: client.sessionDeadReason || null,
     ownId: client.ownId,
+    state: client.state, // PR2 state mapping
     qr: client.qrState ? client.qrState.status : null,
     sseClients: sseClients.size,
+    sqlite: {
+      path: client._dbPath,
+      ready: !!client._store,
+      messages: dbStats?.messages || 0,
+      threads: dbStats?.threads || 0,
+      attachments: dbStats?.attachments || 0,
+      syncPending: syncStats?.pending || 0,
+      syncTotal: syncStats?.total || 0,
+    },
+    catchup: {
+      running: client._catchingUp,
+      lastCatchupAt: client._stats.lastCatchupAt,
+      recoveredCount: client._stats.recoveredCount,
+      lastRecoveredCount: client._stats.lastRecoveredCount,
+      historyFetchErrors: client._stats.historyFetchErrors,
+    },
+    connection: {
+      disconnectCount: client._stats.disconnectCount,
+      lastDisconnectDurationMs: client._stats.lastDisconnectDurationMs,
+      keepAliveFailures: client._stats.keepAliveFailures,
+    }
   });
 });
 

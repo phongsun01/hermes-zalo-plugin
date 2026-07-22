@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **SQLite Message Store (replaces JSON checkpoint)**:
+  - New `lib/sqlite-store.js` — pure DAO with `sql.js` (WASM, no native deps): 5 tables (`messages`, `attachments`, `threads`, `friends`, `sync_state`), WAL-like journal, `PRAGMA user_version`-based migrations, `chmod 600` on db file, transaction helper.
+  - New `lib/message-repository.js` — orchestrator: `saveIncoming()` (insert + checkpoint + thread upsert in one transaction), `saveHistory()` (batch), `getContext()`, `search()`, checkpoint CRUD, `migrateFromJson()` (legacy → SQLite), sync state tracking.
+- **Live message persistence**: `zaloClient.js` now fire-and-forgets `repository.saveIncoming(ev)` on every live message (non-blocking, SSE emits first).
+- **Self-loop aware direction**: Messages are stored with `direction: 'incoming'` or `'outgoing'` based on the `isSelf` flag.
+- **SQLite health status**: `/health` endpoint now exposes `sqlite.messages|threads|attachments|syncPending|syncTotal` instead of the old JSON checkpoint fields.
+- **`lib/` index & smoke tests**: `lib/index.js` re-exports; `scratch/test_sqlite_store.js` (13 tests) + updated `scratch/test_checkpoint.js` (15 tests, all green).
+
+### Changed
+- **zaloClient.js checkpoint engine**: Replaced `_checkpoint` (in-memory JSON), `_loadCheckpoint`, `_saveCheckpoint`, `_checkpointChanged`, `_checkpointTimer` with SQLite-backed `_store`/`_repository`/`_dbChanged`/`_dbTimer`. Migration path: `migrateFromJson()` reads legacy `thread_checkpoint.json` and upserts into SQLite `threads` table.
+- **Graceful shutdown**: `_setupGracefulFlush` and `shutdown()` now persist db + close store instead of writing JSON.
+- **Catchup**: `_catchupMissedMessages()` reads checkpoints from `repository.getCheckpointsForCatchup()` instead of in-memory dict.
+- **Dependency**: Added `sql.js` (pure JS SQLite, no native compilation) instead of `better-sqlite3`.
+
+### Fixed
+- **Foreign key schema**: `messages.message_id` is now `UNIQUE` so `attachments` FK constraint works correctly with `ON DELETE CASCADE`.
+
+## [Unreleased] (previous)
+
+### Added
 - **Group Image Bulk Downloader (`/group/download-images` & `/zl taianh`)**:
   - Added new REST endpoint `POST /group/download-images` with job tracking and SSE `download_progress` event streaming.
   - Added `/zl taianh` slash command & natural language handler ("tải hết ảnh trong group", "tải ảnh từ ngày DD/MM/YYYY") in Python `adapter.py`.
