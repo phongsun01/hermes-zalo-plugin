@@ -602,6 +602,56 @@ app.get("/contacts", asyncHandler(async (req, res) => {
   if (!requireLogin(res)) return;
   res.json({ success: true, ...(await client.listContacts()) });
 }));
+
+// ── Context / Search ──────────────────────────────────────────────────────
+
+// GET /api/context?threadId=xxx&limit=50&fallback=true
+// Returns recent messages for AI context. With fallback=true (default),
+// fetches from API if DB has fewer than limit.
+app.get("/api/context", asyncHandler(async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const repo = client._repository;
+  if (!repo) return res.status(503).json({ error: "repository not ready" });
+  const threadId = req.query.threadId;
+  if (!threadId) return res.status(400).json({ error: "threadId required" });
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const fallback = req.query.fallback !== "false";
+  let messages;
+  if (fallback && requireLogin(res)) {
+    messages = await repo.getRecentMessages(threadId, limit, true);
+  } else {
+    messages = repo.getContext(threadId, limit);
+  }
+  const repoStats = repo.getStats();
+  res.json({
+    success: true, threadId, count: messages.length, total: repoStats.messages,
+    fallbackApplied: fallback && messages.length >= limit,
+    messages,
+  });
+}));
+
+// GET /api/search?q=&threadId=&senderId=&since=&until=&msgType=&direction=&limit=&offset=
+// Searches message history with optional filters.
+app.get("/api/search", asyncHandler(async (req, res) => {
+  if (!checkAuth(req, res)) return;
+  const repo = client._repository;
+  if (!repo) return res.status(503).json({ error: "repository not ready" });
+  const { q, threadId, senderId, since, until, msgType, direction } = req.query;
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const offset = parseInt(req.query.offset) || 0;
+  const messages = repo.search({
+    ...(q ? { text: q } : {}),
+    ...(threadId ? { threadId } : {}),
+    ...(senderId ? { senderId } : {}),
+    ...(since ? { since } : {}),
+    ...(until ? { until } : {}),
+    ...(msgType ? { msgType } : {}),
+    ...(direction ? { direction } : {}),
+    limit, offset,
+  });
+  res.json({ success: true, count: messages.length, messages });
+}));
+
 app.post("/group/create", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
