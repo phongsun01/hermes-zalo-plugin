@@ -1682,7 +1682,7 @@ export class ZaloClient extends EventEmitter {
           msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
         } else {
           // DM: use loadmsg API (verified working for DM in v8)
-          msgs = await this.api.callRaw("loadmsg", [String(threadId), BATCH]);
+          msgs = await this.callRaw("loadmsg", [String(threadId), BATCH]);
         }
         break;
       } catch (err) {

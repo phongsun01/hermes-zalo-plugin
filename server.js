@@ -442,14 +442,37 @@ app.post("/send", asyncHandler(async (req, res) => {
   res.json({ success: true, result: r });
 }));
 
-// Send attachment(s) by local file path(s). Body: { threadId, threadType, paths|path, caption? }
+// Send attachment(s) by local file path(s) OR base64 content. Body: { threadId, threadType, paths|path, caption?, fileBase64?, fileName? }
 app.post("/send-attachment", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", caption } = req.body || {};
+  const { threadId, threadType = "user", caption, fileBase64, fileName } = req.body || {};
+  
+  if (fileBase64) {
+    const buffer = Buffer.from(fileBase64, "base64");
+    const dir = path.dirname(CREDENTIALS_PATH);
+    const tempFileName = `temp_${Date.now()}_${fileName || "image.png"}`;
+    const tempPath = path.join(dir, tempFileName);
+    
+    try {
+      fs.writeFileSync(tempPath, buffer);
+      const r = await client.sendAttachment(threadId, threadType, [tempPath], caption);
+      res.json({ success: true, result: r });
+    } finally {
+      try {
+        if (fs.existsSync(tempPath)) {
+          fs.unlinkSync(tempPath);
+        }
+      } catch (err) {
+        console.error("[zalo] failed to clean up temp file:", err.message);
+      }
+    }
+    return;
+  }
+
   const paths = req.body.paths || (req.body.path ? [req.body.path] : null);
   if (!threadId || !paths || !paths.length) {
-    return res.status(400).json({ error: "threadId and paths required" });
+    return res.status(400).json({ error: "threadId and paths/fileBase64 required" });
   }
   for (const p of paths) {
     if (!fs.existsSync(p)) return res.status(400).json({ error: `file not found: ${p}` });

@@ -344,10 +344,10 @@ class ZaloAdapter(BasePlatformAdapter):
         login_retry = 0
         while login_retry < MAX_LOGIN_RETRIES:
             try:
-                async with self._session.get(
-                    f"{self.bridge_url}/health", timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    data = await resp.json()
+                async def _get_health():
+                    async with self._session.get(f"{self.bridge_url}/health") as resp:
+                        return await resp.json()
+                data = await asyncio.wait_for(_get_health(), timeout=10.0)
             except Exception as e:
                 logger.error("Zalo: cannot reach bridge at %s — %s", self.bridge_url, e)
                 await self._close_session()
@@ -380,10 +380,10 @@ class ZaloAdapter(BasePlatformAdapter):
         # Fetch + log the active action policy (transparency; helps the agent
         # understand what it can/can't do without hitting 403 blindly).
         try:
-            async with self._session.get(
-                f"{self.bridge_url}/policy", timeout=aiohttp.ClientTimeout(total=10)
-            ) as presp:
-                policy = await presp.json()
+            async def _get_policy():
+                async with self._session.get(f"{self.bridge_url}/policy") as presp:
+                    return await presp.json()
+            policy = await asyncio.wait_for(_get_policy(), timeout=10.0)
             self._policy = policy
             logger.info(
                 "Zalo: action policy groups=%s destructive=%s allowed=%s/%s",
@@ -589,13 +589,14 @@ class ZaloAdapter(BasePlatformAdapter):
             await asyncio.sleep(chunk)
             slept += chunk
             try:
-                async with self._session.get(
-                    f"{self.bridge_url}/health",
-                    timeout=aiohttp.ClientTimeout(total=3),
-                    headers={"x-bridge-token": self.bridge_token} if self.bridge_token else {},
-                ) as resp:
-                    if resp.status == 200:
-                        return  # bridge is up, reconnect now
+                async def _poll_health():
+                    async with self._session.get(
+                        f"{self.bridge_url}/health",
+                        headers={"x-bridge-token": self.bridge_token} if self.bridge_token else {},
+                    ) as resp:
+                        return resp.status == 200
+                if await asyncio.wait_for(_poll_health(), timeout=3.0):
+                    return  # bridge is up, reconnect now
             except Exception:
                 pass  # bridge still down
 
@@ -834,16 +835,16 @@ class ZaloAdapter(BasePlatformAdapter):
         kind = media.get("kind") or "other"
         ext = (media.get("ext") or "bin").lstrip(".")
         file_name = media.get("fileName") or f"zalo.{ext}"
-        if not url or not self._session or self._session.closed:
-            return None, MessageType.TEXT
         try:
-            async with self._session.get(
-                url, timeout=aiohttp.ClientTimeout(total=30, sock_read=25)
-            ) as resp:
-                if resp.status != 200:
-                    logger.warning("Zalo: media download failed (%s) for %s", resp.status, kind)
-                    return None, MessageType.TEXT
-                data = await resp.read()
+            async def _download():
+                async with self._session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning("Zalo: media download failed (%s) for %s", resp.status, kind)
+                        return None
+                    return await resp.read()
+            data = await asyncio.wait_for(_download(), timeout=30.0)
+            if data is None:
+                return None, MessageType.TEXT
         except Exception as e:
             logger.warning("Zalo: media download error for %s: %s", kind, e)
             return None, MessageType.TEXT
@@ -918,13 +919,14 @@ class ZaloAdapter(BasePlatformAdapter):
         if not self._session or self._session.closed:
             return {"error": "no session"}
         try:
-            async with self._session.post(
-                f"{self.bridge_url}{path}",
-                data=json.dumps(body),
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                return await resp.json()
+            async def _do():
+                async with self._session.post(
+                    f"{self.bridge_url}{path}",
+                    data=json.dumps(body),
+                    headers=self._headers(),
+                ) as resp:
+                    return await resp.json()
+            return await asyncio.wait_for(_do(), timeout=60.0)
         except Exception as e:
             return {"error": str(e)}
 
@@ -993,20 +995,44 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kwargs):
         thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
-        res = await self._post(
-            "/send-attachment",
-            {"threadId": chat_id, "threadType": thread_type, "path": image_path, "caption": caption or ""},
-        )
+        body = {"threadId": chat_id, "threadType": thread_type, "caption": caption or ""}
+        
+        if os.path.exists(image_path) and os.path.isfile(image_path):
+            import base64
+            try:
+                with open(image_path, "rb") as f:
+                    file_bytes = f.read()
+                body["fileBase64"] = base64.b64encode(file_bytes).decode("utf-8")
+                body["fileName"] = os.path.basename(image_path)
+            except Exception as e:
+                logger.error(f"Failed to read local image file for base64: {e}")
+                body["path"] = image_path
+        else:
+            body["path"] = image_path
+
+        res = await self._post("/send-attachment", body)
         if res.get("error"):
             return SendResult(success=False, error=res["error"])
         return SendResult(success=True)
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
         thread_type = await self._thread_type_from_chat_id(chat_id, metadata)
-        res = await self._post(
-            "/send-attachment",
-            {"threadId": chat_id, "threadType": thread_type, "path": file_path, "caption": caption or ""},
-        )
+        body = {"threadId": chat_id, "threadType": thread_type, "caption": caption or ""}
+        
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            import base64
+            try:
+                with open(file_path, "rb") as f:
+                    file_bytes = f.read()
+                body["fileBase64"] = base64.b64encode(file_bytes).decode("utf-8")
+                body["fileName"] = file_name or os.path.basename(file_path)
+            except Exception as e:
+                logger.error(f"Failed to read local document file for base64: {e}")
+                body["path"] = file_path
+        else:
+            body["path"] = file_path
+
+        res = await self._post("/send-attachment", body)
         if res.get("error"):
             return SendResult(success=False, error=res["error"])
         return SendResult(success=True)
@@ -1123,13 +1149,14 @@ class ZaloAdapter(BasePlatformAdapter):
         if not self._session or self._session.closed:
             return {"error": "no session"}
         try:
-            async with self._session.get(
-                f"{self.bridge_url}{path}",
-                params=params or {},
-                headers=self._headers(),
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as resp:
-                return await resp.json()
+            async def _do():
+                async with self._session.get(
+                    f"{self.bridge_url}{path}",
+                    params=params or {},
+                    headers=self._headers(),
+                ) as resp:
+                    return await resp.json()
+            return await asyncio.wait_for(_do(), timeout=60.0)
         except Exception as e:
             return {"error": str(e)}
 
