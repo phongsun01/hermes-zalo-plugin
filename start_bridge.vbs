@@ -1,0 +1,1 @@
+CreateObject("WScript.Shell").Run "cmd /c cd /d D:\Antigravity\hermes-zalo-plugin && C:\Progra~1\nodejs\node.exe server.js>""D:\Antigravity\hermes-zalo-plugin\bridge_out.log"" 2>""D:\Antigravity\hermes-zalo-plugin\bridge_err.log""", 0, False

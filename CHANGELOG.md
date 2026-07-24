@@ -9,18 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **`zaloClient.js` — Shared content classification + quote media extraction**: Inline ~70-line content classification refactored into shared `classifyContent(msgType, c)` function reused for both `data.content` and `data.quote.attach`. Added `CLIMSGTYPE_TO_MSGTYPE` map for numeric→string msgType conversion. `_normaliseMessage` now returns `quotedText`, `quotedFrom`, `quotedMedia`, `quotedAttachment` from the quoted message.
-- **`server.js` — `/thread-type/:threadId` route**: New GET endpoint queries SQLite persistent checkpoint via `repository.getCheckpoint()`, enabling Python adapter to resolve thread type after restarts or cron cold starts.
-- **`adapter.py` — `_thread_type_from_chat_id` async with bridge fallback**: Changed from sync to async; on cache miss, calls bridge `/thread-type/:threadId` for persistent SQLite lookup instead of silently defaulting to `"user"`. Added warning log when type cannot be determined.
 - **`adapter.py` — `_parse_home_channel` rejects bare IDs**: Bare thread IDs without `group:`/`user:` prefix now return empty (no-op delivery) with a warning, preventing silent misrouting to wrong thread.
-- **`adapter.py` — 9 callers updated**: All 5 send methods (`send`, `send_typing`, `send_image_file`, `send_document`, `send_voice`) + 4 extended actions (`react`, `undo`, `reply`, `send_card`) now use `await self._thread_type_from_chat_id()`.
 
 ### Added
 - **Quote reply context for AI**: Bridge now forwards `quotedText` (text content of the replied-to message), `quotedFrom` (sender name), `quotedMedia` (media object via `classifyContent` on `data.quote.attach`), and `quotedAttachment` to the adapter. Adapter downloads quoted media so the agent can see replied-to images/files, and prepends a `[Trả lời <name>: "text" (kèm media)]\n` prefix to the message text.
 
 ### Fixed
-- **Cron gửi sai thread (root cause)**: `_thread_type_from_chat_id` no longer silently defaults to `"user"` on cache miss after restart. Bridge lookup via `/thread-type/:threadId` resolves thread type from SQLite, which persists across bridge restarts and accumulates data from all inbound messages.
 - **ZALO_HOME_CHANNEL bare ID footgun**: IDs without `group:`/`user:` prefix are now rejected with a clear warning, preventing cron delivery to wrong threads.
 - **`quotedOwnerId` undeclared variable**: Fixed ReferenceError in strict ESM mode — `let quotedOwnerId` was being assigned without declaration in `_normaliseMessage`.
+
+### Removed
+- **Reverted thread routing bridge lookup**: `/thread-type/:threadId` route in `server.js` and async bridge fallback in `_thread_type_from_chat_id` removed — the bridge SQLite lookup approach did not resolve the cron thread routing issue. `_thread_type_from_chat_id` restored to simple sync cache-check with `"user"` default; all 9 callers restored to sync calls.
 
 ## [Unreleased] (previous)
 
