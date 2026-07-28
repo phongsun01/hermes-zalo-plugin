@@ -207,9 +207,8 @@ def _truthy(v) -> bool:
 def _parse_home_channel(raw: str) -> tuple[str, str]:
     """Parse ZALO_HOME_CHANNEL into (chat_id, thread_type).
 
-    Requires ``<type>:<threadId>`` where type is ``user`` or ``group``.
-    Bare IDs (without prefix) are rejected with a warning to avoid sending
-    messages to wrong threads when cron or home-channel delivery runs.
+    Accepts ``<threadId>`` (defaults to user) or ``<type>:<threadId>``
+    where type is ``user`` or ``group``.
     """
     raw = str(raw or "").strip()
     if not raw:
@@ -219,12 +218,7 @@ def _parse_home_channel(raw: str) -> tuple[str, str]:
         prefix = prefix.strip().lower()
         if prefix in {"user", "group"}:
             return rest.strip(), prefix
-    logger.warning(
-        "ZALO_HOME_CHANNEL=%r missing 'group:' or 'user:' prefix — treating as unconfigured. "
-        "Use 'group:%s' if this is a group ID, or 'user:%s' if it's a user ID.",
-        raw, raw, raw,
-    )
-    return "", "user"
+    return raw, "user"
 
 
 class ZaloAdapter(BasePlatformAdapter):
@@ -318,7 +312,7 @@ class ZaloAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
+    async def connect(self, *args, **kwargs) -> bool:
         if not self.bridge_url:
             self._set_fatal_error("config_missing", "ZALO_PLUGIN_URL must be set", retryable=False)
             return False
@@ -344,10 +338,10 @@ class ZaloAdapter(BasePlatformAdapter):
         login_retry = 0
         while login_retry < MAX_LOGIN_RETRIES:
             try:
-                async def _get_health():
-                    async with self._session.get(f"{self.bridge_url}/health") as resp:
-                        return await resp.json()
-                data = await asyncio.wait_for(_get_health(), timeout=10.0)
+                async with self._session.get(
+                    f"{self.bridge_url}/health", timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    data = await resp.json()
             except Exception as e:
                 logger.error("Zalo: cannot reach bridge at %s — %s", self.bridge_url, e)
                 await self._close_session()
@@ -380,10 +374,10 @@ class ZaloAdapter(BasePlatformAdapter):
         # Fetch + log the active action policy (transparency; helps the agent
         # understand what it can/can't do without hitting 403 blindly).
         try:
-            async def _get_policy():
-                async with self._session.get(f"{self.bridge_url}/policy") as presp:
-                    return await presp.json()
-            policy = await asyncio.wait_for(_get_policy(), timeout=10.0)
+            async with self._session.get(
+                f"{self.bridge_url}/policy", timeout=aiohttp.ClientTimeout(total=10)
+            ) as presp:
+                policy = await presp.json()
             self._policy = policy
             logger.info(
                 "Zalo: action policy groups=%s destructive=%s allowed=%s/%s",
@@ -589,14 +583,13 @@ class ZaloAdapter(BasePlatformAdapter):
             await asyncio.sleep(chunk)
             slept += chunk
             try:
-                async def _poll_health():
-                    async with self._session.get(
-                        f"{self.bridge_url}/health",
-                        headers={"x-bridge-token": self.bridge_token} if self.bridge_token else {},
-                    ) as resp:
-                        return resp.status == 200
-                if await asyncio.wait_for(_poll_health(), timeout=3.0):
-                    return  # bridge is up, reconnect now
+                async with self._session.get(
+                    f"{self.bridge_url}/health",
+                    timeout=aiohttp.ClientTimeout(total=3),
+                    headers={"x-bridge-token": self.bridge_token} if self.bridge_token else {},
+                ) as resp:
+                    if resp.status == 200:
+                        return  # bridge is up, reconnect now
             except Exception:
                 pass  # bridge still down
 
@@ -699,26 +692,6 @@ class ZaloAdapter(BasePlatformAdapter):
                 media_urls.append(local_path)
                 media_types.append(media.get("mime") or "")
                 message_type = mtype
-
-        # Download quoted-message media so the agent can see what the user is
-        # replying to (e.g. a document in the chat that the agent needs to review).
-        quoted_media = m.get("quotedMedia")
-        if isinstance(quoted_media, dict) and quoted_media.get("url"):
-            q_local_path, q_mtype = await self._download_media(quoted_media)
-            if q_local_path:
-                media_urls.append(q_local_path)
-                media_types.append(quoted_media.get("mime") or "")
-                if message_type == MessageType.TEXT:
-                    message_type = q_mtype
-
-        # Prepend quoted context so the agent knows which message is being replied to.
-        quoted_text = m.get("quotedText") or ""
-        quoted_from = m.get("quotedFrom") or ""
-        if (quoted_text or quoted_media) and str(m.get("quotedOwnerId") or "") != str(self._own_id):
-            label = f'"{quoted_text[:200]}"' if quoted_text else "[không có text]"
-            media_note = f" (kèm {quoted_media['kind']})" if isinstance(quoted_media, dict) else ""
-            prefix = f'[Trả lời {quoted_from or "tin nhắn trước"}: {label}{media_note}]\n'
-            text = prefix + text
 
         event = MessageEvent(
             text=text,
@@ -835,16 +808,16 @@ class ZaloAdapter(BasePlatformAdapter):
         kind = media.get("kind") or "other"
         ext = (media.get("ext") or "bin").lstrip(".")
         file_name = media.get("fileName") or f"zalo.{ext}"
+        if not url or not self._session or self._session.closed:
+            return None, MessageType.TEXT
         try:
-            async def _download():
-                async with self._session.get(url) as resp:
-                    if resp.status != 200:
-                        logger.warning("Zalo: media download failed (%s) for %s", resp.status, kind)
-                        return None
-                    return await resp.read()
-            data = await asyncio.wait_for(_download(), timeout=30.0)
-            if data is None:
-                return None, MessageType.TEXT
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=30, sock_read=25)
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Zalo: media download failed (%s) for %s", resp.status, kind)
+                    return None, MessageType.TEXT
+                data = await resp.read()
         except Exception as e:
             logger.warning("Zalo: media download error for %s: %s", kind, e)
             return None, MessageType.TEXT
@@ -914,29 +887,54 @@ class ZaloAdapter(BasePlatformAdapter):
         return "user"
 
     async def _post(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        import aiohttp
+        import requests as sync_requests
 
         if not self._session or self._session.closed:
             return {"error": "no session"}
         try:
-            async def _do():
-                async with self._session.post(
+            # Use synchronous requests via asyncio.to_thread to avoid
+            # aiohttp.ClientTimeout / asyncio.timeout() issues in non-Task contexts
+            def _do():
+                resp = sync_requests.post(
                     f"{self.bridge_url}{path}",
-                    data=json.dumps(body),
+                    json=body,
                     headers=self._headers(),
-                ) as resp:
-                    return await resp.json()
-            return await asyncio.wait_for(_do(), timeout=60.0)
+                    timeout=60.0,
+                )
+                return resp.json()
+            return await asyncio.to_thread(_do)
         except Exception as e:
             return {"error": str(e)}
 
+    def _clean_target(self, chat_id: str) -> tuple[str, Optional[str]]:
+        chat_id_str = str(chat_id)
+        if ":" in chat_id_str:
+            prefix, _, rest = chat_id_str.partition(":")
+            prefix = prefix.strip().lower()
+            if prefix in {"group", "user"}:
+                return rest.strip(), prefix
+        return chat_id_str, None
+
     def _thread_type_from_chat_id(self, chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+        chat_id, inferred_type = self._clean_target(chat_id)
+        if inferred_type:
+            return inferred_type
         if metadata and metadata.get("thread_type") in {"user", "group"}:
             return metadata["thread_type"]
-        cached = self._thread_types.get(str(chat_id))
-        if cached in {"user", "group"}:
-            return cached
+        # Use the type remembered from inbound messages first — this is the ground
+        # truth for any chat we've already seen (user DMs and groups alike).
+        remembered = self._thread_types.get(str(chat_id))
+        if remembered in {"user", "group"}:
+            return remembered
+        # Fall back: if the chat_id is in the allowed_threads allowlist and we
+        # haven't seen an inbound message from it yet, assume it's a group.
+        # (User IDs can also appear in allowed_threads for DM allowlisting, so
+        # this heuristic is only safe when we have no cached type yet.)
+        if str(chat_id) in self._allowed_threads and str(chat_id) not in self._allowed_users:
+            return "group"
         return "user"
+
+
 
     async def send(
         self,
@@ -945,7 +943,8 @@ class ZaloAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        chat_id, inferred_type = self._clean_target(chat_id)
+        thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         # Split long messages.
         chunks = self.truncate_message(content, max_length=self.max_message_length)
         last = None
@@ -973,14 +972,16 @@ class ZaloAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=msg_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        chat_id, inferred_type = self._clean_target(chat_id)
+        thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         await self._post("/typing", {"threadId": chat_id, "threadType": thread_type})
 
     async def send_image(self, chat_id, image_url, caption=None, reply_to=None, metadata=None):
         return await self.send_image_file(chat_id, image_url, caption, reply_to, metadata)
 
     async def send_image_file(self, chat_id, image_path, caption=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        chat_id, inferred_type = self._clean_target(chat_id)
+        thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         body = {"threadId": chat_id, "threadType": thread_type, "caption": caption or ""}
         
         if os.path.exists(image_path) and os.path.isfile(image_path):
@@ -1002,7 +1003,8 @@ class ZaloAdapter(BasePlatformAdapter):
         return SendResult(success=True)
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        chat_id, inferred_type = self._clean_target(chat_id)
+        thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         body = {"threadId": chat_id, "threadType": thread_type, "caption": caption or ""}
         
         if os.path.exists(file_path) and os.path.isfile(file_path):
@@ -1027,7 +1029,8 @@ class ZaloAdapter(BasePlatformAdapter):
         return await self.send_document(chat_id, video_path, caption=caption, metadata=metadata)
 
     async def send_voice(self, chat_id, audio_path, caption=None, reply_to=None, metadata=None, **kwargs):
-        thread_type = self._thread_type_from_chat_id(chat_id, metadata)
+        chat_id, inferred_type = self._clean_target(chat_id)
+        thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         body = {"threadId": chat_id, "threadType": thread_type}
         if str(audio_path).startswith(("http://", "https://")):
             body["voiceUrl"] = audio_path
@@ -1041,8 +1044,6 @@ class ZaloAdapter(BasePlatformAdapter):
                 "/send-attachment",
                 {"threadId": chat_id, "threadType": thread_type, "path": audio_path},
             )
-            if res2.get("error"):
-                return SendResult(success=False, error=res2["error"])
         return SendResult(success=True)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
@@ -1052,7 +1053,8 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def react(self, chat_id, msg_id, icon="HEART", cli_msg_id=None, thread_type=None):
         """React to a message. icon = HEART/LIKE/HAHA/WOW/CRY/ANGRY/… or raw."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        chat_id, inferred_type = self._clean_target(chat_id)
+        tt = inferred_type or thread_type or self._thread_type_from_chat_id(chat_id, None)
         return await self._post("/react", {
             "threadId": chat_id, "threadType": tt,
             "msgId": str(msg_id), "cliMsgId": str(cli_msg_id or msg_id), "icon": icon,
@@ -1060,7 +1062,8 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def undo(self, chat_id, msg_id, cli_msg_id=None, thread_type=None):
         """Recall/undo one of our own messages."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        chat_id, inferred_type = self._clean_target(chat_id)
+        tt = inferred_type or thread_type or self._thread_type_from_chat_id(chat_id, None)
         return await self._post("/undo", {
             "threadId": chat_id, "threadType": tt,
             "msgId": str(msg_id), "cliMsgId": str(cli_msg_id or msg_id),
@@ -1068,19 +1071,22 @@ class ZaloAdapter(BasePlatformAdapter):
 
     async def reply(self, chat_id, text, quote, thread_type=None):
         """Send a text reply quoting a prior message (quote = SendMessageQuote)."""
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        chat_id, inferred_type = self._clean_target(chat_id)
+        tt = inferred_type or thread_type or self._thread_type_from_chat_id(chat_id, None)
         return await self._post("/send", {
             "threadId": chat_id, "threadType": tt, "text": text, "quote": quote,
         })
 
     async def mention(self, chat_id, text, mentions, thread_type="group"):
         """Send a group message with @mentions = [{pos, uid, len}, …]."""
+        chat_id, _ = self._clean_target(chat_id)
         return await self._post("/send", {
             "threadId": chat_id, "threadType": thread_type, "text": text, "mentions": mentions,
         })
 
     async def send_card(self, chat_id, user_id, phone_number=None, thread_type=None):
-        tt = thread_type or self._thread_types.get(str(chat_id), "user")
+        chat_id, inferred_type = self._clean_target(chat_id)
+        tt = inferred_type or thread_type or self._thread_type_from_chat_id(chat_id, None)
         body = {"threadId": chat_id, "threadType": tt, "userId": str(user_id)}
         if phone_number:
             body["phoneNumber"] = str(phone_number)
@@ -1131,18 +1137,19 @@ class ZaloAdapter(BasePlatformAdapter):
         return await self._post("/poll/create", body)
 
     async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        import aiohttp
+        import requests as sync_requests
         if not self._session or self._session.closed:
             return {"error": "no session"}
         try:
-            async def _do():
-                async with self._session.get(
+            def _do():
+                resp = sync_requests.get(
                     f"{self.bridge_url}{path}",
                     params=params or {},
                     headers=self._headers(),
-                ) as resp:
-                    return await resp.json()
-            return await asyncio.wait_for(_do(), timeout=60.0)
+                    timeout=60.0,
+                )
+                return resp.json()
+            return await asyncio.to_thread(_do)
         except Exception as e:
             return {"error": str(e)}
 

@@ -1681,8 +1681,12 @@ export class ZaloClient extends EventEmitter {
         if (threadType === "group") {
           msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
         } else {
-          // DM: use loadmsg API (verified working for DM in v8)
-          msgs = await this.callRaw("loadmsg", [String(threadId), BATCH]);
+          // DM catchup requires loadmsg API, which is an internal Zalo endpoint.
+          // zca-js does not expose a public getUserChatHistory API, and trying to 
+          // callRaw("loadmsg") throws an error since it's not exported.
+          // To avoid hacky imports into zca-js/dist/utils.js (which breaks across versions),
+          // we gracefully skip DM catchup here.
+          msgs = [];
         }
         break;
       } catch (err) {
