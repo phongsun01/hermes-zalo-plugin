@@ -56,6 +56,12 @@ function classifyContent(msgType, c) {
     return { text: "", attachment: null, media: null };
   }
 
+  // Plain-text messages with optional styled text: { msg, styles?, mentions? }
+  // msgType is "" (empty) or "webchat" for normal chat messages.
+  if ("msg" in c && (msgType === "" || msgType === "webchat" || !msgType)) {
+    return { text: typeof c.msg === "string" ? c.msg : String(c.msg ?? ""), attachment: null, media: null };
+  }
+
   let params = {};
   try {
     params = typeof c.params === "string" ? JSON.parse(c.params) : c.params || {};
@@ -126,6 +132,47 @@ function classifyContent(msgType, c) {
   }
 
   return { text, attachment, media };
+}
+
+/**
+ * Convert Zalo's inbound `styles` array back into Markdown bold/italic.
+ * Zalo style object: { start: charOffset, len: charCount, st: "b" | "i" }
+ * The plain `msg` string (without any markup) is reconstructed with ** for bold
+ * and _ for italic so the LLM receives standard Markdown.
+ *
+ * Overlapping or out-of-range style spans are silently skipped.
+ */
+function zalostylesToMarkdown(msg, styles) {
+  if (!Array.isArray(styles) || styles.length === 0) return msg;
+
+  // Sort by start position ascending
+  const sorted = [...styles].sort((a, b) => a.start - b.start);
+
+  let result = "";
+  let cursor = 0;
+
+  for (const span of sorted) {
+    const start = span.start ?? 0;
+    const len = span.len ?? 0;
+    const st = span.st || "";
+    if (start < cursor || len <= 0 || start + len > msg.length) continue;
+
+    // Append text before this span
+    result += msg.slice(cursor, start);
+
+    const inner = msg.slice(start, start + len);
+    if (st === "b") {
+      result += `**${inner}**`;
+    } else if (st === "i") {
+      result += `_${inner}_`;
+    } else {
+      result += inner; // unknown style type — pass through unchanged
+    }
+    cursor = start + len;
+  }
+
+  result += msg.slice(cursor);
+  return result;
 }
 
 /**
@@ -1050,6 +1097,12 @@ export class ZaloClient extends EventEmitter {
       text = r.text;
       attachment = r.attachment;
       media = r.media;
+      // Apply inbound styled text → Markdown conversion.
+      // Zalo sends { msg, styles: [{start, len, st}] } for plain messages.
+      // classifyContent extracts only msg; we layer styles on top here.
+      if (r.text && Array.isArray(data.content.styles) && data.content.styles.length > 0) {
+        text = zalostylesToMarkdown(r.text, data.content.styles);
+      }
     }
 
     // ── Quote content (text + media of the message being replied to) ────────
@@ -1681,12 +1734,25 @@ export class ZaloClient extends EventEmitter {
         if (threadType === "group") {
           msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
         } else {
-          // DM catchup requires loadmsg API, which is an internal Zalo endpoint.
-          // zca-js does not expose a public getUserChatHistory API, and trying to 
-          // callRaw("loadmsg") throws an error since it's not exported.
-          // To avoid hacky imports into zca-js/dist/utils.js (which breaks across versions),
-          // we gracefully skip DM catchup here.
-          msgs = [];
+          // DM catchup uses direct call to Zalo loadmsg API using zca-js authenticated session context
+          const ctxHttp = this.api._ctx ? this.api._ctx.http : (this.api.ctx ? this.api.ctx.http : null);
+          if (ctxHttp && typeof ctxHttp.post === "function") {
+            const resp = await ctxHttp.post("https://wpa.chat.zalo.me/api/message/loadmsg", {
+              zpw_ver: 636,
+              zpw_type: 30,
+              params: {
+                threadId: String(threadId),
+                lastId: String(lastMsgId || "0"),
+                count: BATCH,
+                timestamp: 0,
+                type: 1, // 1 = DM/User
+              },
+            });
+            msgs = resp.data?.data?.msgs ?? resp.data?.msgs ?? resp.data;
+          } else {
+            console.warn(`[zalo] HTTP client not available for DM catchup for thread ${threadId}`);
+            msgs = [];
+          }
         }
         break;
       } catch (err) {
