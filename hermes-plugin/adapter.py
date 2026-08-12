@@ -983,9 +983,37 @@ class ZaloAdapter(BasePlatformAdapter):
         chat_id, inferred_type = self._clean_target(chat_id)
         thread_type = inferred_type or self._thread_type_from_chat_id(chat_id, metadata)
         body = {"threadId": chat_id, "threadType": thread_type, "caption": caption or ""}
-        
-        if os.path.exists(image_path) and os.path.isfile(image_path):
-            import base64
+
+        import base64
+
+        if str(image_path).startswith(("http://", "https://")):
+            # Download the image from URL and encode as base64
+            try:
+                import urllib.request
+                from urllib.parse import urlparse
+                import io
+
+                url_path = urlparse(str(image_path)).path
+                # Determine filename from URL, falling back to image.png
+                filename = os.path.basename(url_path) or "image.png"
+                if "." not in filename:
+                    filename = "image.png"
+
+                req = urllib.request.Request(
+                    str(image_path),
+                    headers={"User-Agent": "Mozilla/5.0 (Hermes-Zalo-Plugin/1.0)"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    file_bytes = resp.read()
+
+                body["fileBase64"] = base64.b64encode(file_bytes).decode("utf-8")
+                body["fileName"] = filename
+                logger.debug(f"send_image: downloaded {len(file_bytes)} bytes from URL, filename={filename}")
+            except Exception as e:
+                logger.error(f"send_image: failed to download image from URL {image_path}: {e}")
+                return SendResult(success=False, error=f"Failed to download image from URL: {e}")
+
+        elif os.path.exists(image_path) and os.path.isfile(image_path):
             try:
                 with open(image_path, "rb") as f:
                     file_bytes = f.read()
@@ -1001,6 +1029,7 @@ class ZaloAdapter(BasePlatformAdapter):
         if res.get("error"):
             return SendResult(success=False, error=res["error"])
         return SendResult(success=True)
+
 
     async def send_document(self, chat_id, file_path, caption=None, file_name=None, reply_to=None, metadata=None, **kwargs):
         chat_id, inferred_type = self._clean_target(chat_id)
