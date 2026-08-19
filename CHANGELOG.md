@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Inbound Styled Text to Markdown (`zaloClient.js`)**: Converts received Zalo styled messages (bold, italic) into standard Markdown formatting (`**bold**`, `_italic_`) so LLMs and downstreams receive structured text.
+- **Send Images from URL (`adapter.py`)**: `send_image` / `send_image_file` now automatically downloads images from HTTP/HTTPS URLs and encodes them as base64 attachments.
+- **Rich Text Formatting for Outbound Messages (`zaloClient.js`)**: Parses outbound markdown bold (`**bold**` / `__bold__`) and italic (`_italic_`) into Zalo native `styles` objects while preserving markdown bullet points and ordered lists.
+- **SQLite Persistent Storage (`zaloClient.js`)**: Replaced file-based JSON state with SQLite (`sql.js`) at `~/.hermes-zalo/zalo.sqlite` for persistent `cliMsgId` mapping and checkpoints.
+
+### Fixed
+- **SSE Client Kick Loop on Reconnect (`adapter.py`)**: `connect()` now cancels any existing/dangling `_sse_task` before launching a new SSE inbound loop, preventing concurrent SSE tasks from competing and causing infinite kick-reconnect loops.
+- **List Bullet Point Stripping**: Fixed regex patterns in `sendText` so single-asterisk bullet points (`* item`) are not mistakenly parsed and erased as italic markers.
+
+## [v1.0.8] - Previous
+
 ### Changed
 - **`zaloClient.js` — Shared content classification + quote media extraction**: Inline ~70-line content classification refactored into shared `classifyContent(msgType, c)` function reused for both `data.content` and `data.quote.attach`. Added `CLIMSGTYPE_TO_MSGTYPE` map for numeric→string msgType conversion. `_normaliseMessage` now returns `quotedText`, `quotedFrom`, `quotedMedia`, `quotedAttachment` from the quoted message.
 - **`adapter.py` — `_parse_home_channel` rejects bare IDs**: Bare thread IDs without `group:`/`user:` prefix now return empty (no-op delivery) with a warning, preventing silent misrouting to wrong thread.

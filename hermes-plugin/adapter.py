@@ -390,6 +390,19 @@ class ZaloAdapter(BasePlatformAdapter):
             self._policy = None
             logger.warning("Zalo: could not fetch action policy: %s", e)
 
+        # Cancel any leftover SSE loop from a previous connect() call
+        # (e.g. when the reconnect watcher calls connect() again while the
+        # old SSE task is still running). Without this, two SSE loops compete
+        # for the single-client bridge slot and evict each other in an
+        # infinite kick loop.
+        if self._sse_task and not self._sse_task.done():
+            self._sse_task.cancel()
+            try:
+                await self._sse_task
+            except asyncio.CancelledError:
+                pass
+            self._sse_task = None
+
         # Start the SSE inbound loop.
         self._sse_task = asyncio.create_task(self._sse_loop())
         self._mark_connected()
