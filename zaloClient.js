@@ -1221,7 +1221,42 @@ export class ZaloClient extends EventEmitter {
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
     
-    return await this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType));
+    const targetEnum = this._threadTypeEnum(threadType);
+    try {
+      return await this.api.sendMessage(content, String(threadId), targetEnum);
+    } catch (err) {
+      // Fallback 1: If styles payload fails (e.g., error code 112 / offset mismatch), retry with pure plain text
+      if (styles.length > 0) {
+        console.warn(`[zalo] sendMessage with styles failed (${err.message || err}), retrying with plain text...`);
+        try {
+          const plainContent = { msg: plain };
+          if (Array.isArray(mentions) && mentions.length) plainContent.mentions = mentions;
+          if (quote) plainContent.quote = quote;
+          return await this.api.sendMessage(plainContent, String(threadId), targetEnum);
+        } catch (innerErr) {
+          err = innerErr;
+        }
+      }
+
+      // Fallback 2: If message is still too large (>1200 chars) causing code 112, split and send sequentially
+      if (plain.length > 1200) {
+        console.warn(`[zalo] sendMessage failed with large payload (${plain.length} chars), splitting into smaller chunks...`);
+        const mid = Math.floor(plain.length / 2);
+        const splitIdx = plain.lastIndexOf('\n', mid) !== -1 && plain.lastIndexOf('\n', mid) > mid / 2
+          ? plain.lastIndexOf('\n', mid)
+          : mid;
+        const part1 = plain.slice(0, splitIdx).trim();
+        const part2 = plain.slice(splitIdx).trim();
+        if (part1 && part2) {
+          const res1 = await this.api.sendMessage({ msg: part1 }, String(threadId), targetEnum);
+          await new Promise((r) => setTimeout(r, 400));
+          const res2 = await this.api.sendMessage({ msg: part2 }, String(threadId), targetEnum);
+          return res2 || res1;
+        }
+      }
+
+      throw err;
+    }
   }
 
   // ── Reactions ──────────────────────────────────────────────────────────

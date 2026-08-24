@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SQLite Persistent Storage (`zaloClient.js`)**: Replaced file-based JSON state with SQLite (`sql.js`) at `~/.hermes-zalo/zalo.sqlite` for persistent `cliMsgId` mapping and checkpoints.
 
 ### Fixed
+- **Large Message Payload & Rich Text Fallback (Zalo Error 112)**:
+  - Reduced default `max_message_length` in `adapter.py` from `4000` to `1500` chars (with `ZALO_MAX_MESSAGE_LENGTH` env override) to stay well within Zalo unofficial API single-message payload limits.
+  - Added auto-fallback in `zaloClient.js` `sendText`: if sending with rich text `styles` fails (error code 112 / offset mismatch), it automatically retries as clean plain text.
+  - Added auto-split in `zaloClient.js` `sendText`: if a large message (>1200 chars) fails, it automatically splits at paragraph breaks and delivers sequentially.
 - **SSE Client Kick Loop on Reconnect (`adapter.py`)**: `connect()` now cancels any existing/dangling `_sse_task` before launching a new SSE inbound loop, preventing concurrent SSE tasks from competing and causing infinite kick-reconnect loops.
 - **List Bullet Point Stripping**: Fixed regex patterns in `sendText` so single-asterisk bullet points (`* item`) are not mistakenly parsed and erased as italic markers.
 

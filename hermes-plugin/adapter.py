@@ -277,7 +277,8 @@ class ZaloAdapter(BasePlatformAdapter):
         self.log_ids = _truthy(os.getenv("ZALO_LOG_IDS")) if os.getenv("ZALO_LOG_IDS") else bool(extra.get("log_ids", False))
 
         max_msg = extra.get("max_message_length")
-        self.max_message_length = int(max_msg or 4000)
+        max_msg = extra.get("max_message_length") or os.getenv("ZALO_MAX_MESSAGE_LENGTH")
+        self.max_message_length = int(max_msg or 1500)
 
         self._own_id: Optional[str] = None
         self._own_name: Optional[str] = None
