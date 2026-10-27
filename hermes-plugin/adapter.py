@@ -313,7 +313,8 @@ class ZaloAdapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self, *args, **kwargs) -> bool:
+    async def connect(self, *args, is_reconnect: bool = False, **kwargs) -> bool:
+        del is_reconnect
         if not self.bridge_url:
             self._set_fatal_error("config_missing", "ZALO_PLUGIN_URL must be set", retryable=False)
             return False

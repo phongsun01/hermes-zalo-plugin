@@ -434,11 +434,11 @@ function requireLogin(res) {
 app.post("/send", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", text, mentions, quote } = req.body || {};
+  const { threadId, threadType = "user", text, mentions, quote, styles } = req.body || {};
   if (!threadId || text == null) {
     return res.status(400).json({ error: "threadId and text required" });
   }
-  const r = await client.sendText(threadId, threadType, text, mentions, quote);
+  const r = await client.sendText(threadId, threadType, text, mentions, quote, styles);
   res.json({ success: true, result: r });
 }));
 

@@ -7,6 +7,7 @@ import path from "node:path";
 import { EventEmitter } from "node:events";
 import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
 import { createStore, createRepository, createCache, HistorySync } from "./lib/index.js";
+import { markdownToZalo } from "./markdownToZalo.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -332,6 +333,8 @@ export class ZaloClient extends EventEmitter {
       historyFetchErrors: 0,
     };
     this._lastDisconnectAt = 0;
+    // In-memory 404 tracking per thread: threadId -> { count, lastAt }
+    this._thread404Tracker = new Map();
 
     // Setup graceful flush handlers for process signals
     this._setupGracefulFlush();
@@ -642,7 +645,8 @@ export class ZaloClient extends EventEmitter {
             }
             // The QR image encodes event.data.token (a zaloapp.com/qr URL), NOT
             // event.data.code (the polling session id) — render the token.
-            showQr(event.data.token);
+            const loginUrl = this._qrLoginUrl(event.data.token);
+            showQr(loginUrl);
             break;
           case LoginQRCallbackEventType.QRCodeScanned:
             this._qrState = {
@@ -1006,6 +1010,9 @@ export class ZaloClient extends EventEmitter {
               `content=${typeof d.content === "string" ? JSON.stringify(d.content).slice(0, 80) : JSON.stringify(d.content).slice(0, 400)}`,
           );
         }
+        if (message.threadId) {
+          this._resetThread404(String(message.threadId));
+        }
         const ev = this._normaliseMessage(message);
         if (ev) {
           // Save to SQLite asynchronously (non-blocking SSE; saveIncoming
@@ -1170,54 +1177,37 @@ export class ZaloClient extends EventEmitter {
     return threadType === "group" ? ThreadType.Group : ThreadType.User;
   }
 
+  /**
+   * Build the full Zalo login URL the mobile app expects from the raw QR token.
+   * Zalo's generate endpoint hands back a bare `zaloqr:v2_...` token, but the
+   * app actually scans a `http://zaloapp.com/qr/l?tk=<token>` URL.
+   */
+  _qrLoginUrl(token) {
+    const s = String(token || "");
+    if (!s || /^https?:\/\//i.test(s)) return s;
+    return `http://zaloapp.com/qr/l?tk=${s}`;
+  }
+
   // ── Outbound ──────────────────────────────────────────────────────────
 
-  async sendText(threadId, threadType, text, mentions, quote) {
-    const styles = [];
+  async sendText(threadId, threadType, text, mentions, quote, styles) {
+    const msgText = String(text ?? "");
     let plain = "";
+    let finalStyles = [];
 
-    // Clean structural markdown tags FIRST to preserve correct character indices
-    const cleanedRaw = String(text)
-      .replace(/`{1,3}(.+?)`{1,3}/gs, "$1")
-      .replace(/^#{1,6}\s+/gm, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/^>\s+/gm, "")
-      .replace(/^---+$/gm, "")
-      .replace(/\n{3,}/g, "\n\n");
-    
-    // Pattern to match bold (** or __) and italic (_ only with non-space boundaries) on cleaned text
-    const pattern = /\*\*(.+?)\*\*|__(.+?)__|(?<=\s|^)_(?!\s)(.+?)(?<!\s)_(?=\s|$)/gs;
-    let lastIndex = 0;
-
-    for (const match of cleanedRaw.matchAll(pattern)) {
-      // Add plain text before match
-      plain += cleanedRaw.slice(lastIndex, match.index);
-
-      let inner = "";
-      let styleType = "";
-
-      if (match[1] !== undefined) {
-        inner = match[1];
-        styleType = "b";
-      } else if (match[2] !== undefined) {
-        inner = match[2];
-        styleType = "b";
-      } else if (match[3] !== undefined) {
-        inner = match[3];
-        styleType = "i";
-      }
-
-      const start = plain.length;
-      plain += inner;
-      styles.push({ start, len: inner.length, st: styleType });
-
-      lastIndex = match.index + match[0].length;
+    if (styles && Array.isArray(styles) && styles.length > 0) {
+      // Explicit styles provided — trust caller
+      plain = msgText;
+      finalStyles = styles;
+    } else {
+      // Auto-convert markdown syntax → Zalo styles (bold, italic, underline, strikethrough, heading, color)
+      const converted = markdownToZalo(msgText);
+      plain = converted.text;
+      finalStyles = converted.styles;
     }
 
-    plain += cleanedRaw.slice(lastIndex);
-
     const content = { msg: plain };
-    if (styles.length > 0) content.styles = styles;
+    if (finalStyles.length > 0) content.styles = finalStyles;
     if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
     if (quote) content.quote = quote;
     
@@ -1226,7 +1216,7 @@ export class ZaloClient extends EventEmitter {
       return await this.api.sendMessage(content, String(threadId), targetEnum);
     } catch (err) {
       // Fallback 1: If styles payload fails (e.g., error code 112 / offset mismatch), retry with pure plain text
-      if (styles.length > 0) {
+      if (finalStyles.length > 0) {
         console.warn(`[zalo] sendMessage with styles failed (${err.message || err}), retrying with plain text...`);
         try {
           const plainContent = { msg: plain };
@@ -1677,7 +1667,41 @@ export class ZaloClient extends EventEmitter {
   }
 
   // ── PR3: Catch-up & Replay Engine ────────────────────────────────────────
+  _handleThread404(threadId) {
+    const now = Date.now();
+    const entry = this._thread404Tracker.get(threadId) || { count: 0, lastAt: 0 };
+
+    // Debounce 3 phút (180,000ms): chỉ tính lần 404 tiếp theo nếu cách lần trước ít nhất 180s
+    if (now - entry.lastAt > 180000 || entry.count === 0) {
+      entry.count++;
+      entry.lastAt = now;
+      this._thread404Tracker.set(threadId, entry);
+      console.warn(`[zalo] Thread ${threadId} returned 404/Not Found (${entry.count}/3 consecutive failures)`);
+
+      if (entry.count >= 3) {
+        console.warn(`[zalo] Thread ${threadId} failed 3 consecutive times with 404. Pruning/hiding thread from catchup.`);
+        if (this._repository?.hideThread) {
+          this._repository.hideThread(threadId);
+        }
+        this._thread404Tracker.delete(threadId);
+      }
+    }
+  }
+
+  _resetThread404(threadId) {
+    if (this._thread404Tracker.has(threadId)) {
+      this._thread404Tracker.delete(threadId);
+    }
+  }
+
   async _catchupMissedMessages() {
+    // 1. Kill-switch khẩn cấp đặt ngay đầu hàm
+    if (process.env.ZALO_ENABLE_CATCHUP === "false" || process.env.ZALO_ENABLE_CATCHUP === "0") {
+      console.log("[zalo] Catchup disabled via ZALO_ENABLE_CATCHUP flag.");
+      if (this.state === "CONNECTED") this.setState("READY");
+      return;
+    }
+
     if (this._catchingUp || !this._store || !this._repository) return;
     this._catchingUp = true;
     this.setState("CATCHUP");
@@ -1685,124 +1709,169 @@ export class ZaloClient extends EventEmitter {
     
     this._stats.lastCatchupAt = Date.now();
     let recoveredCount = 0;
-    
-    // 1. Gather candidate threads from SQLite checkpoint, prioritized by most recently updated
-    const threadRows = this._repository.getCheckpointsForCatchup(this.maxTrackedThreads);
-    const threads = threadRows.map((row) => ({
-      threadId: row.thread_id,
-      threadType: row.thread_type,
-      checkpoint: { messageId: row.last_message_id, timestamp: row.last_ts },
-      updatedAt: row.updated_at,
-    }));
+    let consecutiveFailures = 0; // Circuit breaker cho lượt chạy này
 
-    // 2. Scan each thread sequentially using a dedicated throttle queue
-    for (const thread of threads) {
-      if (this.state !== "CATCHUP") {
-        console.log("[zalo] catchup aborted due to connection state change");
-        break;
-      }
-      try {
-        const lastSeen = thread.checkpoint;
-        if (!lastSeen || !lastSeen.timestamp) continue;
+    try {
+      // 1. Gather candidate threads from SQLite checkpoint, prioritized by most recently updated
+      const threadRows = this._repository.getCheckpointsForCatchup(this.maxTrackedThreads);
+      const threads = threadRows.map((row) => ({
+        threadId: row.thread_id,
+        threadType: row.thread_type,
+        checkpoint: { messageId: row.last_message_id, timestamp: row.last_ts },
+        updatedAt: row.updated_at,
+      }));
 
-        // Apply ZALO_CATCHUP_MAX_WINDOW_MS
-        const windowStart = Date.now() - this.maxCatchupWindowMs;
-        const fromTs = Math.max(Number(lastSeen.timestamp), windowStart);
-        
-        console.log(`[zalo] scanning thread ${thread.threadId} (${thread.threadType}) from timestamp ${fromTs} (lastSeen=${lastSeen.timestamp})`);
-        
-        // lastId=0: getGroupChatHistory/loadmsg dùng lastId nghĩa là "cũ hơn ID này",
-        // không phải "mới hơn". Ta luôn lấy N tin gần nhất rồi filter bằng fromTs.
-        const rawMsgs = await this._fetchThreadHistory(thread.threadId, thread.threadType, 0, fromTs);
-        if (!rawMsgs || !rawMsgs.length) continue;
-
-        // 3. Process, normalize, dedup, sort, and emit missed messages
-        const normalized = [];
-        const lastMsgId = lastSeen.messageId || "";
-        const lastTs = Number(lastSeen.timestamp || 0);
-        for (const rawMsg of rawMsgs) {
-          const norm = this._normaliseHistoryMessage(rawMsg, thread.threadId, thread.threadType);
-          if (!norm) continue;
-          // Dedup: chỉ emit nếu message thực sự mới hơn checkpoint
-          // (so sánh timestamp trước, messageId sau để tránh replay tin đã xử lý)
-          const normTs = Number(norm.timestamp || 0);
-          if (normTs < lastTs) continue;
-          if (normTs === lastTs && norm.messageId === lastMsgId) continue;
-          normalized.push(norm);
+      // 2. Scan each thread sequentially using a dedicated throttle queue
+      for (const thread of threads) {
+        if (this.state !== "CATCHUP" || !this.loggedIn || this.sessionDead) {
+          console.log("[zalo] catchup aborted due to connection state change");
+          break;
         }
 
-        // Sort ascending oldest -> newest
-        normalized.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
-
-        // Emit sequential events
-        for (const ev of normalized) {
-          console.log(`[zalo] replay recovered message: ${ev.messageId} (thread=${ev.threadId})`);
-          this.emit("message", ev);
-          this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
-          recoveredCount++;
-          // Small delay to prevent ring buffer exhaustion at receiver
-          await new Promise((r) => setTimeout(r, 50));
+        // Circuit breaker: dừng ngay lượt này nếu gặp 2 lỗi liên tiếp
+        if (consecutiveFailures >= 2) {
+          console.warn("[zalo] Circuit breaker tripped: 2 consecutive failures in catchup pass. Aborting remaining scan to protect WebSocket.");
+          break;
         }
-      } catch (err) {
-        this._stats.historyFetchErrors++;
-        console.error(`[zalo] failed to catchup thread ${thread.threadId}:`, err.message);
+
+        try {
+          const lastSeen = thread.checkpoint;
+          if (!lastSeen || !lastSeen.timestamp) continue;
+
+          // Apply ZALO_CATCHUP_MAX_WINDOW_MS
+          const windowStart = Date.now() - this.maxCatchupWindowMs;
+          const fromTs = Math.max(Number(lastSeen.timestamp), windowStart);
+          const lastMsgId = String(lastSeen.messageId || "0");
+          
+          console.log(`[zalo] scanning thread ${thread.threadId} (${thread.threadType}) from timestamp ${fromTs} (lastSeen=${lastSeen.timestamp})`);
+          
+          const rawMsgs = await this._fetchThreadHistory(thread.threadId, thread.threadType, lastMsgId, fromTs);
+
+          // Quét thành công (kể cả không có tin mới): reset circuit breaker và reset 404 counter
+          consecutiveFailures = 0;
+          this._resetThread404(thread.threadId);
+
+          if (!rawMsgs || !rawMsgs.length) continue;
+
+          // 3. Process, normalize, dedup, sort, and emit missed messages
+          const normalized = [];
+          const lastTs = Number(lastSeen.timestamp || 0);
+          for (const rawMsg of rawMsgs) {
+            const norm = this._normaliseHistoryMessage(rawMsg, thread.threadId, thread.threadType);
+            if (!norm) continue;
+            // Dedup: chỉ emit nếu message thực sự mới hơn checkpoint
+            const normTs = Number(norm.timestamp || 0);
+            if (normTs < lastTs) continue;
+            if (normTs === lastTs && norm.messageId === lastMsgId) continue;
+            normalized.push(norm);
+          }
+
+          // Sort ascending oldest -> newest
+          normalized.sort((a, b) => Number(a.timestamp || 0) - Number(b.timestamp || 0));
+
+          // Emit sequential events
+          for (const ev of normalized) {
+            console.log(`[zalo] replay recovered message: ${ev.messageId} (thread=${ev.threadId})`);
+            this.emit("message", ev);
+            this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
+            recoveredCount++;
+            // Small delay to prevent ring buffer exhaustion at receiver
+            await new Promise((r) => setTimeout(r, 50));
+          }
+        } catch (err) {
+          consecutiveFailures++;
+          this._stats.historyFetchErrors++;
+
+          const errMsg = String((err && err.message) || err || "").toLowerCase();
+          const errStatus = err?.response?.status || err?.status;
+
+          // 1. Chặn ngay nếu gặp 429 / Rate-limit: Ngắt toàn bộ pass catchup để bảo vệ WAF
+          const is429RateLimit = errStatus === 429 || errMsg.includes("429") || errMsg.includes("rate limit") || errMsg.includes("too many requests");
+          if (is429RateLimit) {
+            console.warn(`[zalo] Rate-limited (429) during catchup on thread ${thread.threadId}. Aborting catchup pass immediately.`);
+            break;
+          }
+
+          // 2. PHÂN BIỆT RÕ RÀNG: 404 thật vs Lỗi mạng / Timeout tạm thời
+          const is404Dead = errStatus === 404 || errMsg.includes("404") || errMsg.includes("room does not exist") || errMsg.includes("not found");
+          if (is404Dead) {
+            this._handleThread404(thread.threadId);
+          } else {
+            console.warn(`[zalo] Transient/network error catchup on thread ${thread.threadId} (not 404, will retry next pass): ${err.message}`);
+          }
+
+          // 3. Circuit breaker: dừng pass nếu 2 lỗi liên tiếp
+          if (consecutiveFailures >= 2) {
+            console.warn(`[zalo] Circuit breaker tripped (consecutiveFailures=${consecutiveFailures}). Aborting catchup pass.`);
+            break;
+          }
+        }
+        // sequential throttle between threads (chỉ sleep khi thực sự gọi mạng group)
+        if (thread.threadType === "group") {
+          await new Promise((r) => setTimeout(r, 500));
+        }
       }
-      // sequential throttle between threads
-      await new Promise((r) => setTimeout(r, 1200));
+    } catch (globalErr) {
+      console.error("[zalo] global catchup error:", globalErr.message);
+    } finally {
+      this._stats.recoveredCount += recoveredCount;
+      this._stats.lastRecoveredCount = recoveredCount;
+      console.log(`[zalo] catchup complete. recovered ${recoveredCount} messages (cumulative: ${this._stats.recoveredCount}).`);
+      this._catchingUp = false;
+      // Guard an toàn: chỉ về READY nếu không bị chuyển sang SESSION_DEAD hoặc DISCONNECTED
+      if (this.state === "CATCHUP" || this.state === "CONNECTED") {
+        this.setState("READY");
+      }
     }
-
-    this._stats.recoveredCount += recoveredCount;
-    this._stats.lastRecoveredCount = recoveredCount;
-    console.log(`[zalo] catchup complete. recovered ${recoveredCount} messages (cumulative: ${this._stats.recoveredCount}).`);
-    this._catchingUp = false;
-    this.setState("READY");
   }
 
   async _fetchThreadHistory(threadId, threadType, lastMsgId, fromTs) {
+    if (!this.api) return [];
     const BATCH = this.maxMessagesPerThread || 50;
-    let msgs = null;
-    let attempts = 3;
-    let delay = 1000;
 
-    for (let i = 0; i < attempts; i++) {
-      try {
-        if (threadType === "group") {
-          msgs = await this.api.getGroupChatHistory(String(threadId), BATCH);
-        } else {
-          // DM catchup uses direct call to Zalo loadmsg API using zca-js authenticated session context
-          const ctxHttp = this.api._ctx ? this.api._ctx.http : (this.api.ctx ? this.api.ctx.http : null);
-          if (ctxHttp && typeof ctxHttp.post === "function") {
-            const resp = await ctxHttp.post("https://wpa.chat.zalo.me/api/message/loadmsg", {
-              zpw_ver: 636,
-              zpw_type: 30,
-              params: {
-                threadId: String(threadId),
-                lastId: String(lastMsgId || "0"),
-                count: BATCH,
-                timestamp: 0,
-                type: 1, // 1 = DM/User
-              },
-            });
-            msgs = resp.data?.data?.msgs ?? resp.data?.msgs ?? resp.data;
-          } else {
-            console.warn(`[zalo] HTTP client not available for DM catchup for thread ${threadId}`);
-            msgs = [];
+    // ── Group catchup: Sử dụng getGroupChatHistory chính thức của zca-js ──────
+    if (threadType === "group") {
+      let attempts = 2;
+      let delay = 1000;
+      let msgs = null;
+
+      for (let i = 0; i < attempts; i++) {
+        try {
+          const res = await this.api.getGroupChatHistory(String(threadId), BATCH);
+          // zca-js getGroupChatHistory trả về { groupMsgs: [ GroupMessage { data, ... } ] }
+          const rawList = res?.groupMsgs || res?.data?.groupMsgs || (Array.isArray(res) ? res : []);
+          msgs = rawList.map((m) => (m && m.data ? m.data : m));
+          break;
+        } catch (err) {
+          const errMsg = String((err && err.message) || "").toLowerCase();
+          const errStatus = err?.response?.status || err?.status;
+          const is429 = errStatus === 429 || errMsg.includes("429") || errMsg.includes("rate limit");
+          if (is429) {
+            // Rate-limit: rethrow ngay, tuyệt đối không retry hay fallback
+            throw err;
           }
+          if (i === attempts - 1) throw err;
+          const jitter = 0.8 + Math.random() * 0.4;
+          await new Promise((r) => setTimeout(r, delay * jitter));
+          delay *= 2;
         }
-        break;
-      } catch (err) {
-        if (i === attempts - 1) throw err;
-        const jitter = 0.8 + Math.random() * 0.4;
-        await new Promise((r) => setTimeout(r, delay * jitter));
-        delay *= 2;
       }
+
+      const arr = Array.isArray(msgs) ? msgs : (Array.isArray(msgs?.data) ? msgs.data : []);
+      return arr.filter((m) => {
+        const ts = Number(m.ts || m.timestamp || 0);
+        return ts > fromTs;
+      });
     }
 
-    const arr = Array.isArray(msgs) ? msgs : (Array.isArray(msgs?.data) ? msgs.data : []);
-    return arr.filter((m) => {
-      const ts = Number(m.ts || m.timestamp || 0);
-      return ts > fromTs;
-    });
+    // ── DM catchup: Degrade có kiểm soát ──────────────────────────────────────
+    // DM history via REST (zpw_cht/api/message/loadmsg) returns 400 Bad Request
+    // with {toid, count} and {toid, count, imei} — schema requires additional
+    // fields not present in zca-js's known API set. Verified 2026-10-22.
+    // If a future zca-js version adds official DM history support, or the
+    // correct schema is found, swap this stub for a real implementation —
+    // interface (_fetchThreadHistory returns array, same signature) unchanged.
+    return [];
   }
 
   _normaliseHistoryMessage(rawMsg, threadId, threadType) {
