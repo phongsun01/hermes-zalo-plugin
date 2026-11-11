@@ -957,8 +957,10 @@ export class ZaloClient extends EventEmitter {
 
       // PR2 & PR3: Trigger catchup or transition directly to READY
       this.setState("CONNECTED"); // Ensure state transition CONNECTING/DISCONNECTED -> CONNECTED first
-      if (isFirstConnect) {
-        this.setState("READY"); // First connect doesn't catch up
+      const disconnectDuration = this._stats.lastDisconnectDurationMs || 0;
+      if (isFirstConnect || disconnectDuration < 30000) {
+        // First connect or transient blip (< 30s): no catchup needed, go straight to READY
+        this.setState("READY");
       } else {
         this._catchupMissedMessages().catch((e) => {
           console.error("[zalo] catch-up failed:", e.message);
@@ -1698,7 +1700,15 @@ export class ZaloClient extends EventEmitter {
     // 1. Kill-switch khẩn cấp đặt ngay đầu hàm
     if (process.env.ZALO_ENABLE_CATCHUP === "false" || process.env.ZALO_ENABLE_CATCHUP === "0") {
       console.log("[zalo] Catchup disabled via ZALO_ENABLE_CATCHUP flag.");
-      if (this.state === "CONNECTED") this.setState("READY");
+      if (this.state === "CONNECTED" || this.state === "CATCHUP") this.setState("READY");
+      return;
+    }
+
+    // 2. Cooldown guard: never run catchup more than once every 5 minutes
+    const now = Date.now();
+    if (this._stats.lastCatchupAt && (now - this._stats.lastCatchupAt < 300000)) {
+      console.log("[zalo] Catchup skipped: cooldown active (< 5m since last pass)");
+      if (this.state === "CONNECTED" || this.state === "CATCHUP") this.setState("READY");
       return;
     }
 

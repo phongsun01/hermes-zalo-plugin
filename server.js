@@ -223,7 +223,7 @@ client.on("group_event", (g) => pushEvent("group_event", g));
 const app = express();
 app.use(morgan("dev"));
 app.use(compression());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "50mb" }));
 
 // Apply Rate Limiters on outbound sending routes
 app.use("/send", apiSendLimiter);

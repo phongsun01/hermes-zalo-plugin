@@ -1,18 +1,7 @@
 // markdownToZalo.js
 // Convert Markdown inline formatting to Zalo MessageContent styles array.
-//
-// Supported syntax:
-//   **bold**       → Bold (b)
-//   *italic*       → Italic (i)
-//   __underline__  → Underline (u)
-//   ~~strikethru~~ → StrikeThrough (s)
-//   # heading      → Big (f_18)
-//
-// How it works:
-// 1. Scan the text word-by-word to build a list of formatting spans.
-// 2. Strip all markdown syntax chars to produce clean text.
-// 3. Map each span's content range from original positions → clean positions.
-// 4. Output clean text + styles array.
+// Sequential accumulative parser based on stable pattern to ensure exact
+// character offset alignment (fixing 1-2 character offset errors).
 
 const TextStyle = {
   Bold: "b",
@@ -27,142 +16,15 @@ const TextStyle = {
   Small: "f_13",
 };
 
-// Inline formatting rules: { open, close, style }
-const FORMAT_RULES = [
-  { open: "**", close: "**", style: TextStyle.Bold },
-  { open: "__", close: "__", style: TextStyle.Underline },
-  { open: "~~", close: "~~", style: TextStyle.StrikeThrough },
-  { open: "*", close: "*", style: TextStyle.Italic },
-];
+const COLOR_MAP = {
+  red: TextStyle.Red,
+  orange: TextStyle.Orange,
+  yellow: TextStyle.Yellow,
+  green: TextStyle.Green,
+};
 
-// Color rules: {red:text} {orange:text} {yellow:text} {green:text}
-const COLOR_RULES = [
-  { open: "{red:", close: "}", style: TextStyle.Red },
-  { open: "{orange:", close: "}", style: TextStyle.Orange },
-  { open: "{yellow:", close: "}", style: TextStyle.Yellow },
-  { open: "{green:", close: "}", style: TextStyle.Green },
-];
-
-/**
- * JS-style string length (surrogate pairs = 2).
- */
 function jsStrLen(s) {
-  let len = 0;
-  for (const ch of s) {
-    len += ch.charCodeAt(0) > 0xFFFF ? 2 : 1;
-  }
-  return len;
-}
-
-/**
- * Find all formatting spans in the text.
- * Returns spans sorted by contentStart.
- * Each span: { contentStart, contentEnd, style }
- * Positions are in the ORIGINAL text.
- */
-function findSpans(text) {
-  const allRules = [...FORMAT_RULES, ...COLOR_RULES];
-  const spans = [];
-
-  for (const rule of allRules) {
-    const ol = rule.open.length;
-    const cl = rule.close.length;
-    let i = 0;
-    while (i < text.length) {
-      const oi = text.indexOf(rule.open, i);
-      if (oi === -1) break;
-      const ci = text.indexOf(rule.close, oi + ol);
-      if (ci === -1) break;
-      // Skip empty spans
-      if (ci === oi + ol) {
-        i = ci + cl;
-        continue;
-      }
-      spans.push({
-        contentStart: oi + ol,
-        contentEnd: ci,
-        style: rule.style,
-      });
-      i = ci + cl;
-    }
-  }
-
-  // Heading: # at start-of-line
-  const hdRe = /(^|\n)#+\s/g;
-  let m;
-  while ((m = hdRe.exec(text)) !== null) {
-    const cs = m.index + m[0].length;
-    const nl = text.indexOf("\n", cs);
-    const ce = nl === -1 ? text.length : nl;
-    if (ce > cs) {
-      spans.push({ contentStart: cs, contentEnd: ce, style: TextStyle.Big });
-    }
-  }
-
-  spans.sort((a, b) => a.contentStart - b.contentStart);
-  return spans;
-}
-
-/**
- * Build a set of original-text character indices that are markdown syntax.
- */
-function buildSyntaxSet(text) {
-  const syntax = new Set();
-  const allRules = [...FORMAT_RULES, ...COLOR_RULES];
-  for (const rule of allRules) {
-    const ol = rule.open.length;
-    const cl = rule.close.length;
-    let i = 0;
-    while (i < text.length) {
-      const oi = text.indexOf(rule.open, i);
-      if (oi === -1) break;
-      const ci = text.indexOf(rule.close, oi + ol);
-      if (ci === -1) break;
-      if (ci === oi + ol) {
-        i = ci + cl;
-        continue;
-      }
-      for (let j = 0; j < ol; j++) syntax.add(oi + j);
-      for (let j = 0; j < cl; j++) syntax.add(ci + j);
-      i = ci + cl;
-    }
-  }
-
-  // Heading markers: # (and its following space) at start of line
-  const hdRe = /(^|\n)#+\s/g;
-  let m;
-  while ((m = hdRe.exec(text)) !== null) {
-    for (let j = 0; j < m[0].length; j++) syntax.add(m.index + j);
-  }
-
-  return syntax;
-}
-
-/**
- * Map a range from original text positions to clean text positions.
- * Range: [start, end) in original text (inclusive start, exclusive end).
- * Returns [cleanStart, cleanEnd) or null if the range maps to empty clean text.
- */
-function mapRangeToClean(start, end, originalToClean) {
-  // Find the first clean position >= start
-  let cs = -1;
-  for (let i = start; i < end; i++) {
-    if (originalToClean.has(i)) {
-      cs = originalToClean.get(i);
-      break;
-    }
-  }
-  if (cs === -1) return null;
-
-  // Find the last clean position < end
-  let ce = cs;
-  for (let i = start; i < end; i++) {
-    if (originalToClean.has(i)) {
-      ce = originalToClean.get(i) + 1;
-    }
-  }
-
-  return { start: cs, len: ce - cs };
+  return String(s || "").length;
 }
 
 /**
@@ -174,58 +36,131 @@ function mapRangeToClean(start, end, originalToClean) {
 function markdownToZalo(md) {
   if (!md) return { text: "", styles: [] };
 
-  // Step 1: find markdown syntax positions
-  const syntaxSet = buildSyntaxSet(md);
+  // Normalize Unicode NFC for consistent character indexing across Vietnamese tone marks
+  let src = String(md).normalize("NFC");
 
-  // Step 2: build clean text and original→clean position map
-  let cleanChars = [];
-  const originalToClean = new Map(); // original index → clean index (for non-syntax chars)
+  // Step 1: Clean structural markdown tags that shouldn't appear in Zalo chat
+  // Inline/fenced code: strip backticks, keep code text
+  src = src.replace(/`{1,3}([\s\S]+?)`{1,3}/g, "$1");
+  // Links: [text](url) -> text (url)
+  src = src.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1 ($2)");
+  // Blockquotes: > text -> text
+  src = src.replace(/^>\s+/gm, "");
+  // Horizontal rules: --- -> empty
+  src = src.replace(/^---+$/gm, "");
+  // Collapse excessive newlines (3+ -> 2)
+  src = src.replace(/\n{3,}/g, "\n\n");
 
-  for (let i = 0; i < md.length; i++) {
-    if (!syntaxSet.has(i)) {
-      originalToClean.set(i, cleanChars.length);
-      cleanChars.push(md[i]);
+  const styles = [];
+  let plain = "";
+
+  // Order of regex patterns is critical:
+  // 1. Heading: (^|\n)#{1,6}\s+([^\n]+)
+  // 2. Triple asterisk/underscore: ***bold italic*** or ___bold italic___
+  // 3. Bold: **bold**
+  // 4. Underline: __underline__
+  // 5. StrikeThrough: ~~strikethrough~~
+  // 6. Italic: *italic* or _italic_ (with word/boundary constraints, NEVER matching bullet items)
+  // 7. Color: {color:text}
+  const pattern = new RegExp(
+    [
+      /(?:^|\n)#{1,6}\s+([^\n]+)/.source,
+      /(\*{3}|___)(?!\s)([\s\S]+?)(?<!\s)\2/.source,
+      /\*\*(?!\s)([\s\S]+?)(?<!\s)\*\*/.source,
+      /__([^_]+?)__/.source,
+      /~~(?!\s)([\s\S]+?)(?<!\s)~~/.source,
+      /(?:(?<=\s|^|[^\w*])\*(?!\s)(.+?)(?<!\s)\*(?=\s|[^\w*]|$)|(?<=\s|^|[^\w_])_(?!\s)(.+?)(?<!\s)_(?=\s|[^\w_]|$))/.source,
+      /\{(red|orange|yellow|green):([\s\S]+?)\}/.source,
+    ].join("|"),
+    "gu"
+  );
+
+  let lastIndex = 0;
+
+  for (const match of src.matchAll(pattern)) {
+    // Add text preceding the match
+    let pre = src.slice(lastIndex, match.index);
+
+    // If it's a heading that matched with a leading newline, preserve the newline in pre
+    const matchedStr = match[0];
+    if (match[1] !== undefined && matchedStr.startsWith("\n")) {
+      pre += "\n";
     }
-  }
-  const cleanText = cleanChars.join("");
 
-  // Step 3: find spans in original text
-  const spans = findSpans(md);
+    plain += pre;
 
-  // Step 4: map span content ranges to clean positions
-  const styleEntries = [];
-  for (const sp of spans) {
-    const mapped = mapRangeToClean(sp.contentStart, sp.contentEnd, originalToClean);
-    if (mapped && mapped.len > 0) {
-      styleEntries.push({ start: mapped.start, len: mapped.len, st: sp.style });
+    let inner = "";
+    const styleTypes = [];
+
+    if (match[1] !== undefined) {
+      // Heading
+      inner = match[1];
+      styleTypes.push(TextStyle.Big);
+    } else if (match[3] !== undefined) {
+      // ***bold italic***
+      inner = match[3];
+      styleTypes.push(TextStyle.Bold, TextStyle.Italic);
+    } else if (match[4] !== undefined) {
+      // **bold**
+      inner = match[4];
+      styleTypes.push(TextStyle.Bold);
+    } else if (match[5] !== undefined) {
+      // __underline__
+      inner = match[5];
+      styleTypes.push(TextStyle.Underline);
+    } else if (match[6] !== undefined) {
+      // ~~strikethrough~~
+      inner = match[6];
+      styleTypes.push(TextStyle.StrikeThrough);
+    } else if (match[7] !== undefined) {
+      // *italic*
+      inner = match[7];
+      styleTypes.push(TextStyle.Italic);
+    } else if (match[8] !== undefined) {
+      // _italic_
+      inner = match[8];
+      styleTypes.push(TextStyle.Italic);
+    } else if (match[10] !== undefined) {
+      // {color:text}
+      inner = match[10];
+      const c = COLOR_MAP[match[9]];
+      if (c) styleTypes.push(c);
     }
+
+    const start = plain.length;
+    plain += inner;
+    const len = inner.length;
+
+    for (const st of styleTypes) {
+      styles.push({ start, len, st });
+    }
+
+    lastIndex = match.index + matchedStr.length;
   }
 
-  // Step 5: merge adjacent same-style entries
-  styleEntries.sort((a, b) => a.start - b.start);
+  plain += src.slice(lastIndex);
+
+  // Sort and merge adjacent identical styles
+  styles.sort((a, b) => a.start - b.start);
   const merged = [];
-  for (const e of styleEntries) {
-    const last = merged[merged.length - 1];
-    if (last && last.st === e.st && last.start + last.len === e.start) {
-      last.len += e.len;
+  for (const s of styles) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.st === s.st && prev.start + prev.len === s.start) {
+      prev.len += s.len;
     } else {
-      merged.push({ ...e });
+      merged.push({ ...s });
     }
   }
 
-  return { text: cleanText, styles: merged };
+  return { text: plain, styles: merged };
 }
 
 /**
  * Simple stripper (used as fallback).
  */
 function stripMarkdown(s) {
-  return s
-    .replace(/\*\*(.+?)\*\*/g, "$1")
-    .replace(/\*(.+?)\*/g, "$1")
-    .replace(/__(.+?)__/g, "$1")
-    .replace(/~~(.+?)~~/g, "$1")
-    .replace(/(^|\n)#\s/g, "$1");
+  if (!s) return "";
+  return markdownToZalo(s).text;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -283,7 +218,29 @@ function runTests() {
     {
       name: "emoji test",
       input: "🔥 **bold** 🦞",
-      expect: { text: "🔥 bold 🦞", styles: [{ start: 4, len: 4, st: "b" }] },
+      expect: { text: "🔥 bold 🦞", styles: [{ start: 3, len: 4, st: "b" }] },
+    },
+    {
+      name: "bullet lists with asterisks",
+      input: "* Mục 1: **In đậm 1**\n* Mục 2: **In đậm 2**",
+      expect: {
+        text: "* Mục 1: In đậm 1\n* Mục 2: In đậm 2",
+        styles: [
+          { start: 9, len: 8, st: "b" },
+          { start: 27, len: 8, st: "b" },
+        ],
+      },
+    },
+    {
+      name: "triple asterisk bold+italic",
+      input: "***rất quan trọng***",
+      expect: {
+        text: "rất quan trọng",
+        styles: [
+          { start: 0, len: 14, st: "b" },
+          { start: 0, len: 14, st: "i" },
+        ],
+      },
     },
   ];
 

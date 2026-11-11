@@ -22,6 +22,8 @@ function startBridge() {
       ...process.env,
       ZALO_PLUGIN_HOST: process.env.ZALO_PLUGIN_HOST || "0.0.0.0",
       ZALO_IMAGE_SAVE_PATH: process.env.ZALO_IMAGE_SAVE_PATH || "D:\\ZaloImages",
+      ZALO_ENABLE_CATCHUP: process.env.ZALO_ENABLE_CATCHUP || "false",
+      ZALO_LOG_MESSAGES: process.env.ZALO_LOG_MESSAGES || "1",
     },
   });
 
@@ -38,10 +40,14 @@ async function healthCheck() {
     const res = await fetch("http://127.0.0.1:8787/health");
     const data = await res.json();
 
-    if (data.sessionDead) {
-      console.log("[watchdog] session dead — triggering relogin");
+    if (data.sessionDead || (!data.loggedIn && data.state !== "CATCHUP" && data.state !== "CONNECTING")) {
+      console.log("[watchdog] session dead or not logged in — triggering cookie relogin");
       try {
-        await fetch("http://127.0.0.1:8787/relogin", { method: "POST" });
+        await fetch("http://127.0.0.1:8787/relogin", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ forceQR: false }),
+        });
       } catch {}
     }
   } catch {
