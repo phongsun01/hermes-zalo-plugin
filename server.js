@@ -300,13 +300,18 @@ app.get("/health", (req, res) => {
     sqlite: {
       path: client._dbPath,
       ready: !!client._store,
+      retentionDays: client.sqliteRetentionDays,
       messages: dbStats?.messages || 0,
       threads: dbStats?.threads || 0,
       attachments: dbStats?.attachments || 0,
       syncDone: syncStats?.done || 0,
       syncPending: syncStats?.pending || 0,
       syncTotal: syncStats?.total || 0,
-      dbVersion: 3,
+      dbVersion: 4,
+    },
+    backfill: {
+      user: client._repository?.getBackfillState("user") || null,
+      group: client._repository?.getBackfillState("group") || null,
     },
     cache: cacheStats || {},
     historySync: hs ? {

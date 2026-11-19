@@ -2,7 +2,9 @@
 // bridge-watchdog.js - Auto-restart bridge on crash, never give up
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { WatchdogController } from "./lib/watchdog-core.js";
+import { RotatingLogStream } from "./lib/rotating-logger.js";
 
 const BRIDGE_DIR = import.meta.dirname;
 const RETRY_DELAY_MS = 3000;
@@ -10,7 +12,18 @@ const PORT = parseInt(process.env.ZALO_PLUGIN_PORT || "8787", 10);
 const TOKEN = process.env.ZALO_PLUGIN_TOKEN || "";
 
 const controller = new WatchdogController();
+const rotatingLog = new RotatingLogStream(path.join(BRIDGE_DIR, "bridge.log"), {
+  maxSize: 5 * 1024 * 1024,
+  maxBackups: 3,
+});
+
 let child = null;
+
+function logWatchdog(...args) {
+  const line = args.join(" ") + "\n";
+  process.stdout.write(line);
+  rotatingLog.write(line);
+}
 
 function startBridge() {
   if (child) {
@@ -18,10 +31,10 @@ function startBridge() {
     child = null;
   }
 
-  console.log("[watchdog] starting bridge");
+  logWatchdog("[watchdog] starting bridge");
   child = spawn("node", ["server.js"], {
     cwd: BRIDGE_DIR,
-    stdio: ["inherit", "inherit", "inherit"],
+    stdio: ["inherit", "pipe", "pipe"],
     env: {
       ...process.env,
       ZALO_PLUGIN_HOST: process.env.ZALO_PLUGIN_HOST || "0.0.0.0",
@@ -32,9 +45,19 @@ function startBridge() {
     },
   });
 
+  child.stdout.on("data", (chunk) => {
+    process.stdout.write(chunk);
+    rotatingLog.write(chunk);
+  });
+
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(chunk);
+    rotatingLog.write(chunk);
+  });
+
   child.on("exit", (code) => {
-    console.log(`[watchdog] bridge exited with code ${code}`);
-    console.log(`[watchdog] restarting in ${RETRY_DELAY_MS / 1000}s...`);
+    logWatchdog(`[watchdog] bridge exited with code ${code}`);
+    logWatchdog(`[watchdog] restarting in ${RETRY_DELAY_MS / 1000}s...`);
     setTimeout(startBridge, RETRY_DELAY_MS);
   });
 }
@@ -48,7 +71,7 @@ async function healthCheck() {
 
     const decision = controller.evaluate(data);
     if (decision.action === "relogin") {
-      console.log(
+      logWatchdog(
         `[watchdog] ${decision.reason} detected — triggering cookie relogin (attempt ${controller.consecutiveReloginFailures}/${controller.maxReloginPerHour})`
       );
       const headers = { "Content-Type": "application/json" };
@@ -60,7 +83,7 @@ async function healthCheck() {
           body: JSON.stringify({ forceQR: false }),
         });
       } catch (err) {
-        console.error("[watchdog] relogin request failed:", err?.message || err);
+        logWatchdog("[watchdog] relogin request failed:", err?.message || err);
       }
     }
   } catch {
@@ -70,4 +93,4 @@ async function healthCheck() {
 
 startBridge();
 setInterval(healthCheck, 10000);
-console.log("[watchdog] running — will restart bridge on crash indefinitely");
+logWatchdog("[watchdog] running — will restart bridge on crash indefinitely");

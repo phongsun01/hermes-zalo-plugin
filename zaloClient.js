@@ -326,6 +326,13 @@ export class ZaloClient extends EventEmitter {
     this._catchingUp = false;
     this._catchupEngine = String(process.env.ZALO_CATCHUP_ENGINE || "rest").toLowerCase() === "ws" ? "ws" : "rest";
     this._catchupTruncated = { user: false, group: false };
+    this.sqliteRetentionDays = (() => {
+      const raw = process.env.ZALO_SQLITE_RETENTION_DAYS;
+      if (raw === undefined || raw === "") return 30;
+      const n = parseInt(raw, 10);
+      return Number.isFinite(n) ? n : 30;
+    })();
+    this._purgeInterval = null;
     this._oldMsgs = createOldMessagesCatchup({
       getOwnId: () => this.ownId,
       maxPages: Math.min(Math.max(Number(process.env.ZALO_CATCHUP_MAX_PAGES) || 5, 1), 20),
@@ -360,6 +367,22 @@ export class ZaloClient extends EventEmitter {
 
   _recordSocketActivity() {
     this.lastSocketActivityAt = Date.now();
+  }
+
+  _runRetentionPurge() {
+    if (!this._repository) return;
+    try {
+      const res = this._repository.purgeOldMessages({
+        retentionDays: this.sqliteRetentionDays,
+      });
+      if (!res.skipped && res.deletedMessages > 0) {
+        console.log(
+          `[zalo] SQLite retention: purged ${res.deletedMessages} messages older than ${res.retentionDays} days.`
+        );
+      }
+    } catch (e) {
+      console.error("[zalo] SQLite retention purge error:", e.message);
+    }
   }
 
   // ── Rate-limited, cached read-info gateway ────────────────────────────────
@@ -735,6 +758,13 @@ export class ZaloClient extends EventEmitter {
       // Migrate legacy JSON → SQLite
       this._repository.migrateFromJson(this.checkpointPath);
       console.log("[zalo] SQLite store ready at", this._dbPath);
+
+      // PR3: Initial retention purge & schedule daily purge
+      this._runRetentionPurge();
+      if (!this._purgeInterval) {
+        this._purgeInterval = setInterval(() => this._runRetentionPurge(), 24 * 60 * 60 * 1000);
+        if (this._purgeInterval.unref) this._purgeInterval.unref();
+      }
     }
     // Init in-memory cache
     if (!this._cache) {
@@ -1886,6 +1916,17 @@ export class ZaloClient extends EventEmitter {
     for (const [typeStr, r] of Object.entries(results)) {
       const k = kind(Number(typeStr));
       this._catchupTruncated[k] = Boolean(r.truncated);
+      if (this._repository?.upsertBackfillState) {
+        const lastMsg = r.messages?.length ? r.messages[r.messages.length - 1] : null;
+        const lastTs = lastMsg ? Number(lastMsg.data?.ts || lastMsg.ts || 0) : 0;
+        const lastCursor = lastMsg ? String(lastMsg.data?.msgId || lastMsg.msgId || "") : "";
+        this._repository.upsertBackfillState(k, {
+          cursor: lastCursor,
+          lastTs,
+          status: r.status,
+          syncedCount: r.messages?.length || 0,
+        });
+      }
       if (r.status === "timeout" || r.status === "error") this._stats.historyFetchErrors++;
       for (const raw of r.messages) {
         const ev = this._normaliseMessage(raw);
