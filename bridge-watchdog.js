@@ -22,7 +22,8 @@ function startBridge() {
       ...process.env,
       ZALO_PLUGIN_HOST: process.env.ZALO_PLUGIN_HOST || "0.0.0.0",
       ZALO_IMAGE_SAVE_PATH: process.env.ZALO_IMAGE_SAVE_PATH || "D:\\ZaloImages",
-      ZALO_ENABLE_CATCHUP: process.env.ZALO_ENABLE_CATCHUP || "false",
+      ZALO_CATCHUP_ENGINE: process.env.ZALO_CATCHUP_ENGINE || "ws",
+      ZALO_ENABLE_CATCHUP: process.env.ZALO_ENABLE_CATCHUP || "true",
       ZALO_LOG_MESSAGES: process.env.ZALO_LOG_MESSAGES || "1",
     },
   });

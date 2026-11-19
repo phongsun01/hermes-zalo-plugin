@@ -311,6 +311,8 @@ app.get("/health", (req, res) => {
       lastError: hs.lastError,
     } : null,
     catchup: {
+      engine: client._catchupEngine,
+      truncated: client._catchupTruncated,
       running: client._catchingUp,
       lastCatchupAt: client._stats.lastCatchupAt,
       recoveredCount: client._stats.recoveredCount,

@@ -3,7 +3,8 @@
 # Keep this terminal open; Ctrl+C to stop.
 
 $env:ZALO_PLUGIN_HOST = "0.0.0.0"
-$env:ZALO_ENABLE_CATCHUP = "false"
+$env:ZALO_CATCHUP_ENGINE = "ws"
+$env:ZALO_ENABLE_CATCHUP = "true"
 $env:ZALO_LOG_MESSAGES = "1"
 # Thư mục lưu ảnh tải từ group (mặc định D:\ZaloImages\<groupId>)
 # Thay đổi đường dẫn tại đây nếu muốn lưu sang ổ khác.

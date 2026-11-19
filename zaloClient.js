@@ -8,6 +8,7 @@ import { EventEmitter } from "node:events";
 import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
 import { createStore, createRepository, createCache, HistorySync } from "./lib/index.js";
 import { markdownToZalo } from "./markdownToZalo.js";
+import { createOldMessagesCatchup, THREAD_USER, THREAD_GROUP } from "./lib/old-messages-catchup.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -320,6 +321,13 @@ export class ZaloClient extends EventEmitter {
     this.state = "DISCONNECTED"; // DISCONNECTED, CONNECTING, CONNECTED, CATCHUP, READY
     this._hasConnectedOnce = false;
     this._catchingUp = false;
+    this._catchupEngine = String(process.env.ZALO_CATCHUP_ENGINE || "rest").toLowerCase() === "ws" ? "ws" : "rest";
+    this._catchupTruncated = { user: false, group: false };
+    this._oldMsgs = createOldMessagesCatchup({
+      getOwnId: () => this.ownId,
+      maxPages: Math.min(Math.max(Number(process.env.ZALO_CATCHUP_MAX_PAGES) || 5, 1), 20),
+      maxRounds: Math.min(Math.max(Number(process.env.ZALO_CATCHUP_MAX_ROUNDS) || 3, 1), 10),
+    });
     this._keepAliveConsecutiveFailures = 0;
 
     // Statistics
@@ -935,6 +943,7 @@ export class ZaloClient extends EventEmitter {
 
   _wireListeners() {
     const listener = this.api.listener;
+    this._oldMsgs.attach(listener);
 
     listener.on("connected", () => {
       console.log("[zalo] listener connected");
@@ -1722,6 +1731,11 @@ export class ZaloClient extends EventEmitter {
     let consecutiveFailures = 0; // Circuit breaker cho lượt chạy này
 
     try {
+      if (this._catchupEngine === "ws") {
+        recoveredCount = await this._catchupViaWebSocket();
+        return;
+      }
+
       // 1. Gather candidate threads from SQLite checkpoint, prioritized by most recently updated
       const threadRows = this._repository.getCheckpointsForCatchup(this.maxTrackedThreads);
       const threads = threadRows.map((row) => ({
@@ -1833,6 +1847,49 @@ export class ZaloClient extends EventEmitter {
         this.setState("READY");
       }
     }
+  }
+
+  async _catchupViaWebSocket() {
+    const kind = (type) => (type === THREAD_USER ? "user" : "group");
+    const results = await this._oldMsgs.runCatchup({
+      getCheckpoint: (type) => this._latestCheckpoint(kind(type)),
+      maxWindowMs: this.maxCatchupWindowMs,
+      shouldAbort: () => this.state !== "CATCHUP" || !this.loggedIn || this.sessionDead,
+    });
+
+    let passRecovered = 0;
+    for (const [typeStr, r] of Object.entries(results)) {
+      const k = kind(Number(typeStr));
+      this._catchupTruncated[k] = Boolean(r.truncated);
+      if (r.status === "timeout" || r.status === "error") this._stats.historyFetchErrors++;
+      for (const raw of r.messages) {
+        const ev = this._normaliseMessage(raw);
+        if (!ev) continue;
+        ev.replayed = true;
+        this.emit("message", ev);
+        this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
+        passRecovered++;
+        await new Promise((res) => setTimeout(res, 50));
+      }
+    }
+    return passRecovered;
+  }
+
+  _latestCheckpoint(kind) {
+    if (this._repository?.getLatestCheckpoint) {
+      return this._repository.getLatestCheckpoint(kind);
+    }
+    let best = null;
+    if (this._checkpoint?.threads) {
+      for (const t of Object.values(this._checkpoint.threads)) {
+        if (t.threadType !== kind) continue;
+        const ts = Number(t.checkpoint?.timestamp || 0);
+        if (ts > 0 && t.checkpoint?.messageId && (!best || ts > best.ts)) {
+          best = { msgId: String(t.checkpoint.messageId), ts };
+        }
+      }
+    }
+    return best;
   }
 
   async _fetchThreadHistory(threadId, threadType, lastMsgId, fromTs) {
