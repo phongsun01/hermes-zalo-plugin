@@ -2,10 +2,14 @@
 // bridge-watchdog.js - Auto-restart bridge on crash, never give up
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { WatchdogController } from "./lib/watchdog-core.js";
 
 const BRIDGE_DIR = import.meta.dirname;
 const RETRY_DELAY_MS = 3000;
+const PORT = parseInt(process.env.ZALO_PLUGIN_PORT || "8787", 10);
+const TOKEN = process.env.ZALO_PLUGIN_TOKEN || "";
 
+const controller = new WatchdogController();
 let child = null;
 
 function startBridge() {
@@ -35,21 +39,29 @@ function startBridge() {
   });
 }
 
-// Poll /health to detect session death and trigger relogin
+// Poll /health to detect session death, degraded socket or silent listener
 async function healthCheck() {
   try {
-    const res = await fetch("http://127.0.0.1:8787/health");
+    const res = await fetch(`http://127.0.0.1:${PORT}/health`);
+    if (!res.ok) return;
     const data = await res.json();
 
-    if (data.sessionDead || (!data.loggedIn && data.state !== "CATCHUP" && data.state !== "CONNECTING")) {
-      console.log("[watchdog] session dead or not logged in — triggering cookie relogin");
+    const decision = controller.evaluate(data);
+    if (decision.action === "relogin") {
+      console.log(
+        `[watchdog] ${decision.reason} detected — triggering cookie relogin (attempt ${controller.consecutiveReloginFailures}/${controller.maxReloginPerHour})`
+      );
+      const headers = { "Content-Type": "application/json" };
+      if (TOKEN) headers["x-bridge-token"] = TOKEN;
       try {
-        await fetch("http://127.0.0.1:8787/relogin", {
+        await fetch(`http://127.0.0.1:${PORT}/relogin`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify({ forceQR: false }),
         });
-      } catch {}
+      } catch (err) {
+        console.error("[watchdog] relogin request failed:", err?.message || err);
+      }
     }
   } catch {
     // Bridge not ready yet

@@ -319,6 +319,9 @@ export class ZaloClient extends EventEmitter {
 
     // State machine & Lifecycle
     this.state = "DISCONNECTED"; // DISCONNECTED, CONNECTING, CONNECTED, CATCHUP, READY
+    this.listenerStatus = "disconnected"; // connected, disconnected, closed, degraded
+    this.lastSocketActivityAt = 0;
+    this.lastMessageReceivedAt = 0;
     this._hasConnectedOnce = false;
     this._catchingUp = false;
     this._catchupEngine = String(process.env.ZALO_CATCHUP_ENGINE || "rest").toLowerCase() === "ws" ? "ws" : "rest";
@@ -346,6 +349,17 @@ export class ZaloClient extends EventEmitter {
 
     // Setup graceful flush handlers for process signals
     this._setupGracefulFlush();
+  }
+
+  get status() {
+    if (this.sessionDead) return "dead";
+    if (!this.loggedIn) return "disconnected";
+    if (this.listenerStatus !== "connected") return "degraded";
+    return "healthy";
+  }
+
+  _recordSocketActivity() {
+    this.lastSocketActivityAt = Date.now();
   }
 
   // ── Rate-limited, cached read-info gateway ────────────────────────────────
@@ -947,6 +961,8 @@ export class ZaloClient extends EventEmitter {
 
     listener.on("connected", () => {
       console.log("[zalo] listener connected");
+      this.listenerStatus = "connected";
+      this._recordSocketActivity();
       const isFirstConnect = !this._hasConnectedOnce;
       this._hasConnectedOnce = true;
       this.sessionDead = false;
@@ -979,6 +995,7 @@ export class ZaloClient extends EventEmitter {
     listener.on("disconnected", (code, reason) => {
       // Transient drop; zca-js will auto-retry (retryOnClose). Just surface it.
       console.log("[zalo] listener disconnected", code, reason);
+      this.listenerStatus = "disconnected";
       this.setState("DISCONNECTED"); // PR2: State Machine transition
       this._stats.disconnectCount++;
       this._lastDisconnectAt = Date.now();
@@ -990,6 +1007,7 @@ export class ZaloClient extends EventEmitter {
       // are terminal — re-scanning QR is the only recovery, so don't auto-retry.
       // Anything else (cookie/network) gets an automatic cookie relogin first.
       console.log("[zalo] listener CLOSED", code, reason);
+      this.listenerStatus = "closed";
       this.setState("DISCONNECTED"); // PR2: State Machine transition
       this.loggedIn = false;
       this._reconnecting = false; // ★ avoid starvation when code 1000 fires
@@ -1004,9 +1022,12 @@ export class ZaloClient extends EventEmitter {
     });
     listener.on("error", (err) => {
       console.error("[zalo] listener error:", err);
+      this.listenerStatus = "degraded";
     });
 
     listener.on("message", (message) => {
+      this._recordSocketActivity();
+      this.lastMessageReceivedAt = Date.now();
       try {
         const isGroup = message.type === ThreadType.Group;
         const d = message.data || {};
@@ -1042,6 +1063,7 @@ export class ZaloClient extends EventEmitter {
 
     // Reactions (thả tim/like…) on messages.
     listener.on("reaction", (reaction) => {
+      this._recordSocketActivity();
       try {
         const d = reaction.data || {};
         this.emit("reaction", {
@@ -1060,6 +1082,7 @@ export class ZaloClient extends EventEmitter {
 
     // Message undo/recall (thu hồi).
     listener.on("undo", (undo) => {
+      this._recordSocketActivity();
       try {
         const d = undo.data || {};
         this.emit("undo", {
@@ -1076,6 +1099,7 @@ export class ZaloClient extends EventEmitter {
 
     // Friend events (requests, accepts, etc.).
     listener.on("friend_event", (ev) => {
+      this._recordSocketActivity();
       try {
         this.emit("friend_event", { type: ev.type, data: ev.data, isSelf: !!ev.isSelf });
       } catch (e) {
@@ -1085,6 +1109,7 @@ export class ZaloClient extends EventEmitter {
 
     // Group events (join/leave/rename/admin, etc.).
     listener.on("group_event", (ev) => {
+      this._recordSocketActivity();
       try {
         this.emit("group_event", { type: ev.type, data: ev.data, isSelf: !!ev.isSelf });
       } catch (e) {

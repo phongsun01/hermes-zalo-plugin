@@ -285,6 +285,10 @@ app.get("/health", (req, res) => {
   const hs = client._historySync || null;
   res.json({
     ok: true,
+    status: client.status,
+    listenerStatus: client.listenerStatus,
+    lastSocketActivityAt: client.lastSocketActivityAt,
+    lastMessageReceivedAt: client.lastMessageReceivedAt,
     bootId: BOOT_ID,
     loggedIn: client.loggedIn,
     sessionDead: !!client.sessionDead,
@@ -346,7 +350,7 @@ app.get("/qr.png", (req, res) => {
 
 // Recover a dead/expired session: re-run login (QR by default). Returns once
 // a new QR is generated; poll /qr or /qr.png to scan it, then /health.
-app.post("/relogin", asyncHandler(async (req, res) => {
+app.post(["/relogin", "/admin/relogin"], asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   const forceQR = req.body && req.body.forceQR === false ? false : true;
   // Kick off relogin in the background; respond immediately so the caller
