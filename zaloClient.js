@@ -9,6 +9,8 @@ import { Zalo, ThreadType, LoginQRCallbackEventType, Reactions } from "zca-js";
 import { createStore, createRepository, createCache, HistorySync } from "./lib/index.js";
 import { markdownToZalo } from "./markdownToZalo.js";
 import { createOldMessagesCatchup, THREAD_USER, THREAD_GROUP } from "./lib/old-messages-catchup.js";
+import { PriorityRateLimiter } from "./lib/priority-rate-limiter.js";
+import { chunkTextAndStyles, DEFAULT_CHUNK_SIZE } from "./lib/smart-chunker.js";
 
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0";
@@ -353,6 +355,12 @@ export class ZaloClient extends EventEmitter {
     this._lastDisconnectAt = 0;
     // In-memory 404 tracking per thread: threadId -> { count, lastAt }
     this._thread404Tracker = new Map();
+
+    // PR5: Priority Token Bucket Rate Limiter (burst: 5, steady: 20/min)
+    this.rateLimiter = new PriorityRateLimiter({
+      burst: parseInt(process.env.ZALO_RATE_BURST, 10) || 5,
+      ratePerMinute: parseInt(process.env.ZALO_RATE_PER_MINUTE, 10) || 20,
+    });
 
     // Setup graceful flush handlers for process signals
     this._setupGracefulFlush();
@@ -1256,7 +1264,7 @@ export class ZaloClient extends EventEmitter {
 
   // ── Outbound ──────────────────────────────────────────────────────────
 
-  async sendText(threadId, threadType, text, mentions, quote, styles) {
+  async sendText(threadId, threadType, text, mentions, quote, styles, options = {}) {
     const msgText = String(text ?? "");
     let plain = "";
     let finalStyles = [];
@@ -1272,59 +1280,76 @@ export class ZaloClient extends EventEmitter {
       finalStyles = converted.styles;
     }
 
-    const content = { msg: plain };
-    if (finalStyles.length > 0) content.styles = finalStyles;
-    if (Array.isArray(mentions) && mentions.length) content.mentions = mentions;
-    if (quote) content.quote = quote;
-    
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
     const targetEnum = this._threadTypeEnum(threadType);
-    try {
-      return await this.api.sendMessage(content, String(threadId), targetEnum);
-    } catch (err) {
-      // Fallback 1: If styles payload fails (e.g., error code 112 / offset mismatch), retry with pure plain text
-      if (finalStyles.length > 0) {
-        console.warn(`[zalo] sendMessage with styles failed (${err.message || err}), retrying with plain text...`);
+    const maxChunkSize = Number(process.env.ZALO_CHUNK_SIZE) || DEFAULT_CHUNK_SIZE;
+
+    // Helper to send a single chunk safely via rateLimiter with styles -> plain fallback
+    const sendSingleChunk = async (chunkText, chunkStyles, chunkMentions, chunkQuote) => {
+      const content = { msg: chunkText };
+      if (chunkStyles && chunkStyles.length > 0) content.styles = chunkStyles;
+      if (Array.isArray(chunkMentions) && chunkMentions.length) content.mentions = chunkMentions;
+      if (chunkQuote) content.quote = chunkQuote;
+
+      return await this.rateLimiter.enqueue(async () => {
         try {
-          const plainContent = { msg: plain };
-          if (Array.isArray(mentions) && mentions.length) plainContent.mentions = mentions;
-          if (quote) plainContent.quote = quote;
-          return await this.api.sendMessage(plainContent, String(threadId), targetEnum);
-        } catch (innerErr) {
-          err = innerErr;
+          return await this.api.sendMessage(content, String(threadId), targetEnum);
+        } catch (err) {
+          // Fallback: If styles payload fails (e.g., error code 112 / offset mismatch), retry with pure plain text
+          if (content.styles && content.styles.length > 0) {
+            console.warn(`[zalo] sendMessage with styles failed (${err.message || err}), retrying chunk with plain text...`);
+            try {
+              const plainContent = { msg: chunkText };
+              if (content.mentions) plainContent.mentions = content.mentions;
+              if (content.quote) plainContent.quote = content.quote;
+              return await this.api.sendMessage(plainContent, String(threadId), targetEnum);
+            } catch (innerErr) {
+              err = innerErr;
+            }
+          }
+          throw err;
+        }
+      }, { priority });
+    };
+
+    // If message is larger than maxChunkSize (~1500 chars), split smartly
+    if (plain.length > maxChunkSize) {
+      console.log(`[zalo] message exceeds chunk size (${plain.length} > ${maxChunkSize}), splitting into chunks...`);
+      const chunks = chunkTextAndStyles(plain, finalStyles, maxChunkSize);
+      let lastResult = null;
+
+      for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        // Only attach quote and mentions to the first chunk
+        const chunkQuote = i === 0 ? quote : undefined;
+        const chunkMentions = i === 0 ? mentions : undefined;
+
+        lastResult = await sendSingleChunk(c.text, c.styles, chunkMentions, chunkQuote);
+
+        // Pause briefly between chunks to guarantee in-order delivery
+        if (i < chunks.length - 1) {
+          await new Promise((r) => setTimeout(r, 300));
         }
       }
 
-      // Fallback 2: If message is still too large (>1200 chars) causing code 112, split and send sequentially
-      if (plain.length > 1200) {
-        console.warn(`[zalo] sendMessage failed with large payload (${plain.length} chars), splitting into smaller chunks...`);
-        const mid = Math.floor(plain.length / 2);
-        const splitIdx = plain.lastIndexOf('\n', mid) !== -1 && plain.lastIndexOf('\n', mid) > mid / 2
-          ? plain.lastIndexOf('\n', mid)
-          : mid;
-        const part1 = plain.slice(0, splitIdx).trim();
-        const part2 = plain.slice(splitIdx).trim();
-        if (part1 && part2) {
-          const res1 = await this.api.sendMessage({ msg: part1 }, String(threadId), targetEnum);
-          await new Promise((r) => setTimeout(r, 400));
-          const res2 = await this.api.sendMessage({ msg: part2 }, String(threadId), targetEnum);
-          return res2 || res1;
-        }
-      }
-
-      throw err;
+      return lastResult;
     }
+
+    // Short message: send directly via sendSingleChunk
+    return await sendSingleChunk(plain, finalStyles, mentions, quote);
   }
 
   // ── Reactions ──────────────────────────────────────────────────────────
   /** React to a message. iconName is a key of Reactions (HEART, LIKE, HAHA…) or a raw icon string. */
-  async react(threadId, threadType, msgId, cliMsgId, iconName) {
+  async react(threadId, threadType, msgId, cliMsgId, iconName, options = {}) {
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
     const icon = Reactions[iconName] !== undefined ? Reactions[iconName] : iconName;
     const dest = {
       data: { msgId: String(msgId), cliMsgId: String(cliMsgId || msgId) },
       threadId: String(threadId),
       type: this._threadTypeEnum(threadType),
     };
-    return await this.api.addReaction(icon, dest);
+    return await this.rateLimiter.enqueue(() => this.api.addReaction(icon, dest), { priority });
   }
 
   // ── Undo (thu hồi) ───────────────────────────────────────────────────────
@@ -1343,18 +1368,26 @@ export class ZaloClient extends EventEmitter {
         "undo: real cliMsgId not found for this msgId (need the message to have passed through the listener)",
       );
     }
-    return await this.api.undo(
-      { msgId: String(msgId), cliMsgId: cli },
-      String(threadId),
-      this._threadTypeEnum(threadType),
+    return await this.rateLimiter.enqueue(
+      () =>
+        this.api.undo(
+          { msgId: String(msgId), cliMsgId: cli },
+          String(threadId),
+          this._threadTypeEnum(threadType),
+        ),
+      { priority: "high" }
     );
   }
 
   // ── Contact card (danh thiếp) ─────────────────────────────────────────────
-  async sendCard(threadId, threadType, userId, phoneNumber) {
+  async sendCard(threadId, threadType, userId, phoneNumber, options = {}) {
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
     const opts = { userId: String(userId) };
     if (phoneNumber) opts.phoneNumber = String(phoneNumber);
-    return await this.api.sendCard(opts, String(threadId), this._threadTypeEnum(threadType));
+    return await this.rateLimiter.enqueue(
+      () => this.api.sendCard(opts, String(threadId), this._threadTypeEnum(threadType)),
+      { priority }
+    );
   }
 
   // ── Friends ───────────────────────────────────────────────────────────────
@@ -1413,19 +1446,31 @@ export class ZaloClient extends EventEmitter {
    * Send one or more local file paths as attachments (images, files, video).
    * zca-js routes by extension automatically.
    */
-  async sendAttachment(threadId, threadType, filePaths, caption) {
+  async sendAttachment(threadId, threadType, filePaths, caption, options = {}) {
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
     const attachments = Array.isArray(filePaths) ? filePaths : [filePaths];
     const content = { msg: caption ? String(caption) : "", attachments };
-    return await this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType));
+    return await this.rateLimiter.enqueue(
+      () => this.api.sendMessage(content, String(threadId), this._threadTypeEnum(threadType)),
+      { priority }
+    );
   }
 
-  async sendSticker(threadId, threadType, sticker) {
+  async sendSticker(threadId, threadType, sticker, options = {}) {
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
     // sticker: { id, cateId, type } per zca-js StickerDetail
-    return await this.api.sendSticker(sticker, String(threadId), this._threadTypeEnum(threadType));
+    return await this.rateLimiter.enqueue(
+      () => this.api.sendSticker(sticker, String(threadId), this._threadTypeEnum(threadType)),
+      { priority }
+    );
   }
 
-  async sendVoice(threadId, threadType, voiceUrl) {
-    return await this.api.sendVoice({ voiceUrl }, String(threadId), this._threadTypeEnum(threadType));
+  async sendVoice(threadId, threadType, voiceUrl, options = {}) {
+    const priority = options.priority === "low" || options.replayed ? "low" : "high";
+    return await this.rateLimiter.enqueue(
+      () => this.api.sendVoice({ voiceUrl }, String(threadId), this._threadTypeEnum(threadType)),
+      { priority }
+    );
   }
 
   /**
@@ -1851,6 +1896,7 @@ export class ZaloClient extends EventEmitter {
           // Emit sequential events
           for (const ev of normalized) {
             console.log(`[zalo] replay recovered message: ${ev.messageId} (thread=${ev.threadId})`);
+            ev.replayed = true;
             this.emit("message", ev);
             this._updateThreadLastSeen(ev.threadId, ev.messageId, ev.timestamp, ev.threadType);
             recoveredCount++;

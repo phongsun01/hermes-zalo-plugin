@@ -153,18 +153,23 @@ flowchart TD
 
 ---
 
-### PR 5: Priority Rate Limiter & Smart Chunking
+### PR 5: Priority Rate Limiter & Smart Chunking (ĐÃ HOÀN THÀNH)
 
 1. **Phân Biệt Tin Nhắn Ưu Tiên Thấp (Cờ `replayed`)**:
    - Khi engine catchup khôi phục tin nhắn lỡ, gắn cờ `replayed: true` vào event gửi sang adapter.
    - Khi Hermes gửi tin trả lời, truyền kèm `replayed: true` (hoặc `priority: "low"`) về endpoint `/send`.
-   - **Chính sách**: Tin replayed có mốc thời gian quá 10 phút trước đó sẽ không tự động trả lời để tránh làm phiền hội thoại cũ.
-2. **Token Bucket Rate Limiter**:
-   - Burst: 5 tin. Refill: 20 tin/phút. Hàng đợi ưu tiên: `HIGH` (chat trực tiếp) luôn đi trước `LOW` (catchup/bulk).
-3. **Smart Chunking An Toàn (~1500 Chars)**:
-   - Giới hạn lý thuyết của Zalo là 3000 UTF-16, nhưng phụ tải bao gồm byte UTF-8 Tiếng Việt có dấu cộng JSON styles rất dễ chạm ngưỡng payload của Zalo WAF (sinh lỗi Unknown hoặc Error 112).
-   - Chọn ngưỡng chunk an toàn là **~1500 ký tự** tại các ranh giới tự nhiên (`\n\n`, `\n`, `. `).
-   - Tính toán lại offset cho các style markdown cho từng chunk; nếu không thể bảo toàn offset thì fallback về plain text để giữ nội dung.
+   - **Chính sách**: Tin replayed có mốc thời gian quá 10 phút trước đó (`Date.now() - msgTimestamp > 10 * 60 * 1000`) sẽ tự động bị bridge hủy (`dropped: true`, `reason: "stale_reply"`) để tránh làm phiền hội thoại cũ.
+2. **Token Bucket Rate Limiter (`lib/priority-rate-limiter.js`)**:
+   - Burst: 5 tin. Refill: 20 tin/phút (1 token mỗi 3 giây).
+   - Hàng đợi ưu tiên kép: `HIGH` (chat trực tiếp) luôn đi trước `LOW` (catchup/bulk/replay).
+   - Đã tích hợp vào `sendText`, `sendAttachment`, `sendSticker`, `sendVoice`, `sendCard`, `react`, `undo`.
+3. **Smart Chunking An Toàn (~1500 Chars) (`lib/smart-chunker.js`)**:
+   - Giới hạn lý thuyết của Zalo là 3000 UTF-16, nhưng phụ tải bao gồm byte UTF-8 Tiếng Việt có dấu cộng JSON styles rất dễ chạm ngưỡng payload của Zalo WAF (sinh lỗi Unknown hoặc Error 112). Vì vậy, ngưỡng chunk an toàn được cố định là **~1500 ký tự** (hoặc cấu hình qua `ZALO_CHUNK_SIZE`).
+   - Cắt tại các ranh giới tự nhiên (`\n\n`, `\n`, `. `, `, `, ` `).
+   - Tự động tính toán lại offset style cho từng chunk (`chunkTextAndStyles`); nếu payload style bị lỗi từ Zalo API thì fallback về plain text để bảo toàn nội dung.
+4. **Adapter Python (`hermes-plugin/adapter.py`)**:
+   - Truyền `replayed: True` và `messageTs` khi reply tin nhắn từ raw metadata.
+   - Bắt và xử lý kết quả `dropped: true` từ bridge khi tin nhắn quá hạn 10 phút.
 
 ---
 

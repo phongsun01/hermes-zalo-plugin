@@ -332,7 +332,8 @@ app.get("/health", (req, res) => {
       disconnectCount: client._stats.disconnectCount,
       lastDisconnectDurationMs: client._stats.lastDisconnectDurationMs,
       keepAliveFailures: client._stats.keepAliveFailures,
-    }
+    },
+    rateLimiter: client.rateLimiter ? client.rateLimiter.stats : null,
   });
 });
 
@@ -439,25 +440,48 @@ function requireLogin(res) {
   return true;
 }
 
-// Send text. Body: { threadId, threadType, text, mentions?, quote? }
+// Send text. Body: { threadId, threadType, text, mentions?, quote?, styles?, priority?, replayed?, messageTs? }
 //   mentions: [{ pos, uid, len }]  — group @mention
 //   quote:    SendMessageQuote captured from an inbound message (reply)
+//   priority: "high" | "low" (interactive chat replies = high; catchup/broadcasts = low)
 app.post("/send", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", text, mentions, quote, styles } = req.body || {};
+  const { threadId, threadType = "user", text, mentions, quote, styles, priority, replayed, isReplay, messageTs, ts } = req.body || {};
   if (!threadId || text == null) {
     return res.status(400).json({ error: "threadId and text required" });
   }
-  const r = await client.sendText(threadId, threadType, text, mentions, quote, styles);
+
+  const isReplayed = replayed === true || isReplay === true;
+  const effectivePriority = priority === "low" || isReplayed ? "low" : "high";
+
+  // Stale reply guard: replayed messages older than 10 minutes (configurable via ZALO_STALE_REPLY_MS)
+  // are dropped to avoid spamming historical conversations.
+  if (isReplayed) {
+    const rawTs = messageTs || ts || quote?.ts;
+    const msgTimestamp = typeof rawTs === "string" ? parseInt(rawTs, 10) : Number(rawTs);
+    const staleThresholdMs = parseInt(process.env.ZALO_STALE_REPLY_MS, 10) || (10 * 60 * 1000);
+    if (msgTimestamp && !isNaN(msgTimestamp) && Date.now() - msgTimestamp > staleThresholdMs) {
+      console.warn(`[bridge] dropping stale reply for replayed message in thread ${threadId} (age: ${Math.round((Date.now() - msgTimestamp) / 1000)}s > ${staleThresholdMs / 1000}s)`);
+      return res.json({
+        success: false,
+        dropped: true,
+        reason: "stale_reply",
+        ageMs: Date.now() - msgTimestamp,
+        thresholdMs: staleThresholdMs,
+      });
+    }
+  }
+
+  const r = await client.sendText(threadId, threadType, text, mentions, quote, styles, { priority: effectivePriority, replayed: isReplayed });
   res.json({ success: true, result: r });
 }));
 
-// Send attachment(s) by local file path(s) OR base64 content. Body: { threadId, threadType, paths|path, caption?, fileBase64?, fileName? }
+// Send attachment(s) by local file path(s) OR base64 content. Body: { threadId, threadType, paths|path, caption?, fileBase64?, fileName?, priority? }
 app.post("/send-attachment", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", caption, fileBase64, fileName } = req.body || {};
+  const { threadId, threadType = "user", caption, fileBase64, fileName, priority } = req.body || {};
   
   if (fileBase64) {
     const buffer = Buffer.from(fileBase64, "base64");
@@ -467,7 +491,7 @@ app.post("/send-attachment", asyncHandler(async (req, res) => {
     
     try {
       fs.writeFileSync(tempPath, buffer);
-      const r = await client.sendAttachment(threadId, threadType, [tempPath], caption);
+      const r = await client.sendAttachment(threadId, threadType, [tempPath], caption, { priority });
       res.json({ success: true, result: r });
     } finally {
       try {
@@ -488,25 +512,25 @@ app.post("/send-attachment", asyncHandler(async (req, res) => {
   for (const p of paths) {
     if (!fs.existsSync(p)) return res.status(400).json({ error: `file not found: ${p}` });
   }
-  const r = await client.sendAttachment(threadId, threadType, paths, caption);
+  const r = await client.sendAttachment(threadId, threadType, paths, caption, { priority });
   res.json({ success: true, result: r });
 }));
 
-// Send sticker. Body: { threadId, threadType, sticker: { id, cateId, type } }
+// Send sticker. Body: { threadId, threadType, sticker: { id, cateId, type }, priority? }
 app.post("/send-sticker", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", sticker } = req.body || {};
+  const { threadId, threadType = "user", sticker, priority } = req.body || {};
   if (!threadId || !sticker) return res.status(400).json({ error: "threadId and sticker required" });
-  const r = await client.sendSticker(threadId, threadType, sticker);
+  const r = await client.sendSticker(threadId, threadType, sticker, { priority });
   res.json({ success: true, result: r });
 }));
 
-// Send voice. Body: { threadId, threadType, voiceUrl } OR { ..., path } (local file → real voice bubble)
+// Send voice. Body: { threadId, threadType, voiceUrl, priority? } OR { ..., path } (local file → real voice bubble)
 app.post("/send-voice", asyncHandler(async (req, res) => {
   if (!checkAuth(req, res)) return;
   if (!requireLogin(res)) return;
-  const { threadId, threadType = "user", voiceUrl, path: filePath } = req.body || {};
+  const { threadId, threadType = "user", voiceUrl, path: filePath, priority } = req.body || {};
   if (!threadId || (!voiceUrl && !filePath)) {
     return res.status(400).json({ error: "threadId and (voiceUrl or path) required" });
   }
@@ -515,7 +539,7 @@ app.post("/send-voice", asyncHandler(async (req, res) => {
     if (!fs.existsSync(filePath)) return res.status(400).json({ error: `file not found: ${filePath}` });
     r = await client.sendVoiceLocal(threadId, threadType, filePath);
   } else {
-    r = await client.sendVoice(threadId, threadType, voiceUrl);
+    r = await client.sendVoice(threadId, threadType, voiceUrl, { priority });
   }
   res.json({ success: true, result: r });
 }));

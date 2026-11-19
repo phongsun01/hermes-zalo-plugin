@@ -966,10 +966,21 @@ class ZaloAdapter(BasePlatformAdapter):
         for chunk in chunks:
             if not chunk.strip():
                 continue
-            res = await self._post(
-                "/send",
-                {"threadId": chat_id, "threadType": thread_type, "text": chunk},
-            )
+            payload = {"threadId": chat_id, "threadType": thread_type, "text": chunk}
+            if metadata:
+                is_replayed = bool(metadata.get("replayed") or (metadata.get("raw_message") or {}).get("replayed"))
+                if is_replayed:
+                    payload["replayed"] = True
+                    msg_ts = metadata.get("ts") or (metadata.get("raw_message") or {}).get("ts")
+                    if msg_ts:
+                        payload["messageTs"] = msg_ts
+                if metadata.get("priority"):
+                    payload["priority"] = metadata.get("priority")
+
+            res = await self._post("/send", payload)
+            if res.get("dropped"):
+                logger.info("Zalo: reply dropped by bridge policy (%s)", res.get("reason"))
+                return SendResult(success=True, message_id=None)
             if res.get("error"):
                 return SendResult(success=False, error=res["error"])
             last = res
