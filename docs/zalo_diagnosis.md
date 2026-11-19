@@ -1416,6 +1416,51 @@ Hàng trăm dòng 429 liên tục trong nhiều phút.
 
 ---
 
+## Fix #37 — `congchuc_scrape.py`: Báo thông báo "0 VB đến mới" khi không có công văn mới (2026-11-19)
+
+**Triệu chứng:**
+Cronjob "Quet cong van den" (job_id: `202d81764afb`) gửi tin nhắn Zalo mỗi lần quét kể cả khi không có công văn mới:
+```
+📋 0 VB đến mới (2256, 226)
+(2026-11-19 16:02:11)
+
+📊 0 mới (khẩn: 0, thường: 0)
+🔗 https://congchuc.quangninh.gov.vn/Default.aspx?tabid=1126
+```
+
+**Nguyên nhân gốc rễ:**
+Điều kiện silent-exit cũ ở dòng 1072 (`congchuc_scrape.py`):
+```python
+if not new_docs and not attachment_results and not auto_finish_list:
+    sys.exit(0)
+```
+Khi `auto_finish_list` không rỗng (có VB cũ cần auto-finish chạy ngầm), hoặc `attachment_results` không rỗng, điều kiện bị bỏ qua → script tiếp tục in block summary kể cả khi `new_docs = []`, tạo ra thông báo "0 VB đến mới" vô nghĩa.
+
+**Cách khắc phục:**
+Đơn giản hóa điều kiện: chỉ cần `new_docs` rỗng là thoát im lặng — `auto_finish_list` chạy ngầm qua `subprocess.Popen` không cần thông báo, `attachment_results` không có ý nghĩa nếu không có doc mới nào:
+
+```python
+# Trước (dòng 1071-1073):
+# Silent if no new docs and no attachments downloaded
+if not new_docs and not attachment_results and not auto_finish_list:
+    sys.exit(0)
+
+# Sau:
+# Silent if no new docs (auto_finish runs silently in background, no need to notify)
+if not new_docs:
+    sys.exit(0)
+```
+
+**File đã sửa:**
+- `C:\Users\Desktop\.hermes\scripts\congchuc\congchuc_scrape.py` (dòng 1072)
+- Sync → `home\scripts\congchuc\congchuc_scrape.py`
+- Sync → `skills\cc\scripts\congchuc_scrape.py`
+
+**Kết quả:**
+Khi không có công văn đến mới, script thoát im lặng (exit 0, không có stdout) → Zalo không nhận thông báo nào.
+
+---
+
 ## 📚 Tham khảo
 
 - [zaloclaw](https://github.com/monas-team/zaloclaw) — Plugin Zalo cho OpenClaw, nguồn cảm hứng cho keepAlive mechanism
